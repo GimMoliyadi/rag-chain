@@ -1,0 +1,49 @@
+# 已实测环境（2026-09-15，Windows 11 + RTX 4050 Laptop 6GB）：
+#   fastapi 0.141.1  uvicorn 0.53.0  chromadb 1.5.9  openai 3.14.0
+#   PyYAML 6.0.3  numpy 2.4.6  torch 2.14.0+cu130  transformers 5.17.0
+#   sentence-transformers 6.0.1  tokenizers 0.23.2  pytest 9.1.1  httpx 0.28.1
+# 需要 bit-for-bit 复现时按这份装；否则下面的下限允许安全升级。
+# 唯一 pin 死的是 sentence-transformers，原因见它上面那段注释。
+
+# Web 框架与服务器
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# 向量数据库（本地持久化，无需额外服务）
+chromadb>=0.5
+
+# OpenAI 兼容接口的官方 SDK（同时用于 LLM 和 Embedding）
+openai>=1.40
+
+# Anthropic Messages API 的官方 SDK（LLM_PROVIDER=anthropic 时用）
+# 零参构造会自动从 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN 解析凭证，
+# 所以这个 provider 不需要把 token 写进 .env。
+anthropic>=1.0
+
+# 配置解析：YAML frontmatter
+pyyaml>=6.0
+
+# 数值计算：本地离线 embedding 用
+numpy>=1.26
+
+# 本地语义 Embedding（EMBEDDING_PROVIDER=local_semantic）
+# 这里 pin 死而不写 >=，因为本项目的踩坑点就在这个库的参数校验上：
+# encode() 会拒绝不认识的额外关键字（6.0.1 直接报 ValueError，max_length
+# 就是这样被挡掉的）。版本一变，"下限版本也能跑"这个假设就不成立。
+#
+# 本项目真正用到的 API 面（全部在 6.0.1 源码里逐个核对过）：
+#   SentenceTransformer(model_name, device=..., model_kwargs={"torch_dtype": ...})
+#   model.eval()
+#   model.max_seq_length = N          # setter，直接写进 tokenizer
+#   model.tokenizer(texts, truncation=False)
+#   model.encode(texts, normalize_embeddings=..., show_progress_bar=..., convert_to_numpy=...)
+# 都不是 6.x 新增的特性。pin 6.0.1 是为了和已实测的环境一致，不是因为代码
+# 依赖 6.x；换成别的版本时该验证的是 encode() 收哪些关键字，而不是这些调用点。
+sentence-transformers==6.0.1
+# 上面的依赖会装 torch。注意：PyPI 默认装的是 CPU 版 torch，
+# 有 NVIDIA 显卡想跑 CUDA，需要额外装一次官方 CUDA 版（命令见 README）
+# 本项目没有直接 import transformers，它只作为 sentence-transformers 的传递依赖。
+
+# 测试
+pytest>=8.0
+httpx>=0.27

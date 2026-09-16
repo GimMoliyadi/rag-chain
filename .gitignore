@@ -1,0 +1,19 @@
+# 运行时生成的数据，不进版本库
+data/
+
+# 真实密钥
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
