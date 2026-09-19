@@ -78,6 +78,11 @@ def main() -> None:
     print(f"新增文档    : {stats.added}")
     print(f"更新文档    : {stats.updated}")
     print(f"未变化跳过  : {stats.unchanged}   ← 增量生效，重复跑不会重复插库")
+    if args.path is None and args.limit is None:
+        print(f"删除同步    : {stats.removed}   ← 文件已删、库里已清，不会留幽灵知识")
+    else:
+        print("删除同步    : 已跳过（--path / --limit 只扫了一部分文件，"
+              "无法判断哪些是删除，全库同步要跑一次不带参数的 python ingest.py）")
     print(f"写入 chunk  : {stats.chunks_written}")
     print(f"失败        : {stats.failed}")
     if stats.errors:

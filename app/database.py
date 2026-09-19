@@ -121,6 +121,18 @@ def upsert_document(conn: sqlite3.Connection, doc: ParsedDocument) -> tuple[int,
     return cur.lastrowid, True, True
 
 
+def delete_document(conn: sqlite3.Connection, document_id: int) -> bool:
+    """按 id 删掉一篇文档，chunks 靠外键级联一起删掉。
+
+    返回 True 表示确实删到了一行，False 表示这个 id 本来就不在库里。
+    区分这两者是为了让 stats.removed 不虚高：级联删除不需要显式写，
+    因为连接上开了 PRAGMA foreign_keys = ON，否则这条外键只是摆设。
+    """
+    cur = conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def replace_chunks(conn: sqlite3.Connection, document_id: int, chunks: list[Chunk]) -> int:
     """整体替换某个文档的切块结果，返回写入的块数。
 
@@ -176,6 +188,16 @@ def list_documents(conn: sqlite3.Connection, limit: int = 50, offset: int = 0) -
         item["tags"] = [t for t in item.pop("tags").split(",") if t]
         results.append(item)
     return results
+
+
+def list_document_ids_by_path(conn: sqlite3.Connection) -> dict[str, int]:
+    """已入库文档的 file_path -> id 映射。
+
+    删除同步需要同时拿到路径和 id：路径用来和 Vault 里实际存在的文件比对，
+    id 用来清掉 Chroma 里对应的向量。file_path 是 UNIQUE 的，所以这个映射不会丢信息。
+    """
+    rows = conn.execute("SELECT file_path, id FROM documents").fetchall()
+    return {row["file_path"]: row["id"] for row in rows}
 
 
 def get_chunks(conn: sqlite3.Connection, document_id: int) -> list[dict]:

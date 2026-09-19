@@ -11,6 +11,7 @@
       -> embedding.embed                  批量算向量
       -> store.delete_by_document         先清掉这个文档的旧向量
       -> store.upsert_chunks              写入新向量
+      -> _remove_deleted                  收尾清掉"文件已删、库里还在"的幽灵文档
 
 另有 rebuild_vectors()：换 embedding 模型时只重建 Chroma，
 chunk 原文一个字都没变，不需要重新解析 Vault。
@@ -25,10 +26,12 @@ from .chunker import chunk_markdown
 from .config import Settings
 from .database import (
     connect,
+    delete_document,
     get_chunks,
     get_document,
     get_chunks_for_reindex,
     init_db,
+    list_document_ids_by_path,
     replace_chunks,
     upsert_document,
 )
@@ -50,6 +53,7 @@ class IngestStats:
     added: int = 0           # 首次入库
     updated: int = 0         # 内容变化被更新
     unchanged: int = 0       # 内容没变被跳过（增量生效的证据）
+    removed: int = 0         # 文件已从 Vault 删掉、库里被清掉的文档（删除同步）
     failed: int = 0          # 解析或写入失败
     chunks_written: int = 0
     truncated: int = 0       # 超过 embedding 模型 token 上限、被截尾的 chunk
@@ -208,19 +212,50 @@ def ingest_vault(
     path_filter: str | None = None,
     limit: int | None = None,
 ) -> IngestStats:
-    """遍历 Vault 文件并逐个入库。单个文件失败不会中断整次 ingest。"""
+    """遍历 Vault 文件并逐个入库。单个文件失败不会中断整次 ingest。
+
+    收尾再做一遍删除同步：库里记着、Vault 里已经不存在的路径要整篇清掉，
+    否则被删的笔记会变成永远检索不到的"幽灵知识"。
+    """
     stats = IngestStats()
     files = iter_markdown_files(settings.vault_path_resolved, path_filter=path_filter, limit=limit)
     stats.scanned = len(files)
 
+    # 记录这次扫描在磁盘上真正看到的相对路径。必须在 try 之外加：
+    # 一个文件读失败不代表它被删了，不能因此清掉它已有的知识。
+    seen_paths: set[str] = set()
     for path in files:
+        seen_paths.add(path.relative_to(settings.vault_path_resolved).as_posix())
         try:
             _ingest_one(settings, embedding, store, conn, path, stats)
         except Exception as exc:
             stats.failed += 1
             stats.errors.append(f"{path.as_posix()}: {exc}")
 
+    _remove_deleted(store, conn, seen_paths, stats, full_scan=path_filter is None and limit is None)
     return stats
+
+
+def _remove_deleted(store, conn, seen_paths, stats: IngestStats, full_scan: bool) -> None:
+    """清掉"库里还在、Vault 里已经不存在"的文档，连同它的 chunk 和向量。
+
+    full_scan=False 时整个跳过：--path / --limit 扫到的只是一部分文件，
+    剩下那部分在库里完全正常，却被误判成"已删除"——一次 --path "法律" 就能删空全库。
+    """
+    if not full_scan:
+        return
+
+    for file_path, document_id in list_document_ids_by_path(conn).items():
+        if file_path in seen_paths:
+            continue
+        try:
+            # 向量先清：这一步失败时 SQLite 完全没动，下次重跑能原样重试
+            store.delete_by_document(document_id)
+            if delete_document(conn, document_id):
+                stats.removed += 1
+        except Exception as exc:
+            stats.failed += 1
+            stats.errors.append(f"{file_path}: {exc}")
 
 
 def _ingest_one(settings, embedding, store, conn, path, stats: IngestStats) -> None:
@@ -234,8 +269,15 @@ def _ingest_one(settings, embedding, store, conn, path, stats: IngestStats) -> N
 
     chunks = chunk_markdown(doc.content, doc.title, settings.chunk_size, settings.chunk_overlap)
     if not chunks:
-        # 空文档没有可检索的内容，不算成功也不算失败
-        stats.unchanged += 1
+        # 正文被清空、切不出任何块：上面的 upsert_document 已经把 SQLite 里的
+        # 全文更新成空内容，但旧 chunk 和旧向量还挂着，照样能被检索命中——
+        # 那才是真正的幽灵知识。所以这里必须把两边一起清掉。
+        store.delete_by_document(document_id)
+        replace_chunks(conn, document_id, [])
+        if created:
+            stats.added += 1
+        else:
+            stats.updated += 1
         return
 
     replace_chunks(conn, document_id, chunks)
