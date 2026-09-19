@@ -1,0 +1,56 @@
+{
+  "example_only": true,
+  "not_real_evaluation_data": true,
+  "notice": "Example only — not real evaluation data. This file exists solely so a fresh clone can see the question-set schema without receiving the real set. Every question, every document path and every keyword here is fabricated and matches no document in the knowledge base this repository was built against. Point --questions at eval/retrieval_questions.json instead (a local, git-ignored file). The numbers in RETRIEVAL_BASELINE.md come from that real set and cannot be reproduced from this file.",
+  "corpus": "虚构语料 /fictional-corpus",
+  "questions": [
+    {
+      "id": 1,
+      "question": "虚构语料里那条主定理，成立需要哪些前提？",
+      "expected_documents": ["虚构语料/02-定理/主定理.md"],
+      "expected_keywords": ["主定理", "成立条件", "前提"],
+      "category": "direct",
+      "verified": false,
+      "note": "虚构题面。用于展示 direct 类：题面用词几乎照抄文档标题。"
+    },
+    {
+      "id": 2,
+      "question": "换一种说法：那条主定理能不能用在条件只满足一半的场景里？",
+      "expected_documents": ["虚构语料/02-定理/主定理.md"],
+      "expected_keywords": ["主定理", "适用范围", "前提"],
+      "category": "paraphrase",
+      "verified": false,
+      "note": "虚构题面。用于展示 paraphrase 类：同一知识点改写措辞，用来测 embedding 对同义表达的鲁棒性。"
+    },
+    {
+      "id": 3,
+      "question": "虚构语料里，A 流程和 B 流程的验收标准到底差在哪一条？",
+      "expected_documents": [
+        "虚构语料/03-流程/A流程.md",
+        "虚构语料/03-流程/B流程.md"
+      ],
+      "expected_keywords": ["验收标准", "A流程", "B流程", "差异"],
+      "category": "multi_chunk",
+      "verified": false,
+      "note": "虚构题面。用于展示 multi_chunk 类：expected_documents 多于一个，答案分散在多篇文档里。"
+    },
+    {
+      "id": 4,
+      "question": "虚构语料里有没有讲过怎么分配季度奖金？",
+      "expected_documents": [],
+      "expected_keywords": ["季度奖金", "分配"],
+      "category": "unknown",
+      "verified": false,
+      "note": "虚构题面。用于展示 unknown 类：语料里没有答案，参与覆盖度检查但不计分。期望系统是明确说明信息不足，而不是顺着说出一段看起来合理的内容。"
+    },
+    {
+      "id": 5,
+      "question": "虚构语料里关于养猫喂养建议有哪些？",
+      "expected_documents": [],
+      "expected_keywords": ["养猫", "喂养"],
+      "category": "unknown",
+      "verified": false,
+      "note": "虚构题面。用于展示 unknown 类：话题和语料主题完全无关。"
+    }
+  ]
+}

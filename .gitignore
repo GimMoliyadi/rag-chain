@@ -1,8 +1,33 @@
 # 运行时生成的数据，不进版本库
 data/
 
-# 真实密钥
+# 真实密钥（任何形如 token / secret 的环境文件都不进版本库）
 .env
+.env.local
+.env.*.local
+*.token
+*.pem
+*.key
+
+# 评测原始结果：检索命中路径暴露私人知识库结构，rag 结果里还有 LLM 依据知识库
+# 生成的完整答案。结论已经固化在 README / RETRIEVAL_BASELINE.md 的汇总表里，
+# 原始 JSON 留在本地做追溯用，不进版本库。
+eval/results/
+
+# 真实题集：32 道题面 + expected_documents 暴露私人知识库的目录结构。
+# 进库的只有同构的 eval/retrieval_questions.example.json（5 道虚构题，只做 schema 说明）。
+eval/retrieval_questions.json
+
+# probe 脚本的临时输出和日志：数字会随时间失效，不适合进版本库
+logs_*.txt
+logs_*.log
+*.log
+probe_output*.txt
+
+# HuggingFace 模型缓存（模型权重，几十上百 MB，且本机缓存在仓库之外）
+*.pt
+*.safetensors
+.cache/
 
 # Python
 __pycache__/

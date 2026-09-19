@@ -10,10 +10,12 @@
 """
 from __future__ import annotations
 
+import json
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import Settings
@@ -21,7 +23,8 @@ from .database import connect, get_document, init_db, list_documents
 from .embedding import BaseEmbedding, get_embedding_client
 from .ingest import IngestStats, run_ingest
 from .llm import BaseLLM, get_llm_client
-from .rag import RAGEngine
+from .rag import RAGEngine, source_to_dict
+from .reranker import CrossEncoderReranker
 from .retriever import EmbeddingMismatchError, Retriever
 from .vectorstore import ChromaStore
 
@@ -44,7 +47,16 @@ def create_app(
     init_db(conn)
 
     retriever = Retriever(embedding=embedding, store=store, default_top_k=settings.top_k)
-    engine = RAGEngine(retriever=retriever, llm=llm, top_k=settings.top_k, vault_name=settings.vault_name)
+    engine = RAGEngine(
+        retriever=retriever,
+        llm=llm,
+        top_k=settings.top_k,
+        vault_name=settings.vault_name,
+        context_filter_enabled=settings.context_filter_enabled,
+        filter_retrieve_top_k=settings.filter_retrieve_top_k,
+        reranker=_build_reranker(settings),
+        reranker_candidate_top_k=settings.reranker_candidate_top_k,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -102,7 +114,7 @@ def _register_routes(app: FastAPI) -> None:
         doc = get_document(app.state.conn, document_id)
         if doc is None:
             raise HTTPException(status_code=404, detail=f"文档 {document_id} 不存在")
-        doc.pop("content_hash", None)  # 增量入库用的内部字段，不暴露给前端
+        doc.pop("content_hash", None)  # 增量入库用的内部字段，不暴露给调用方
         return doc
 
     @app.get("/api/search")
@@ -130,23 +142,27 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.post("/api/chat")
     def chat(request: ChatRequest):
-        """完整 RAG 问答：检索 + 生成 + 引用来源。"""
+        """完整 RAG 问答：检索 + 生成 + 引用来源。非流式，一次回完整结果。"""
         result = app.state.rag.answer(request.question, top_k=request.top_k)
         return {
             "answer": result.answer,
             "used_chunks": result.used_chunks,
-            "sources": [
-                {
-                    "index": s.index,
-                    "title": s.title,
-                    "file_path": s.file_path,
-                    "heading": s.heading,
-                    "score": s.score,
-                    "chunk": s.content,
-                }
-                for s in result.sources
-            ],
+            "sources": [source_to_dict(s) for s in result.sources],
         }
+
+    @app.post("/api/chat/stream")
+    def chat_stream(request: ChatRequest):
+        """流式版问答：SSE 事件流，阶段进度见 /api/chat/stream 的说明。
+
+        /api/chat 一行没改语义，这个端点只是同一套 RAG 逻辑多一条出口。
+        X-Accel-Buffering 关掉代理缓冲，否则阶段事件会被攒成一包一起到达，
+        调用方就看不到「正在检索 → 正在生成」的切换。
+        """
+        return StreamingResponse(
+            _sse_events(app.state.rag.answer_stream(request.question, top_k=request.top_k)),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.post("/api/ingest")
     def ingest(request: IngestRequest):
@@ -167,6 +183,17 @@ def _register_routes(app: FastAPI) -> None:
         return _stats_payload(stats)
 
 
+def _sse_events(events: Iterator[dict]) -> Iterator[str]:
+    """把 rag 层的事件 dict 包装成 SSE 帧。
+
+    SSE 线格式：`data: <一行 JSON>` + 空行结束一帧。空行是帧的分隔标志，
+    缺了它接收端会把多帧粘成一条。这里刻意不写 `event:` 行，
+    事件名放在 JSON 的 event 字段里，调用方解析一个字段就够。
+    """
+    for event in events:
+        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, description="用户问题")
     top_k: int | None = Field(default=None, ge=1, le=20, description="检索条数，不传用配置里的 TOP_K")
@@ -175,6 +202,25 @@ class ChatRequest(BaseModel):
 class IngestRequest(BaseModel):
     path_filter: str | None = Field(default=None, description="只导入路径包含该片段的文件，如 '01-精益创业2.0'")
     limit: int | None = Field(default=None, ge=1, le=5000, description="最多导入多少篇，用于小规模试跑")
+
+
+def _build_reranker(settings: Settings) -> CrossEncoderReranker | None:
+    """只有显式开启精排时才构造并加载模型，关着的时候一个字节显存都不占。
+
+    在 create_app 里同步加载而不是留到第一个请求上：加载一次约 7 秒
+    （393 个分片），留到请求上会表现为第一次问答莫名多等 7 秒。
+    """
+    if not settings.reranker_enabled:
+        return None
+    reranker = CrossEncoderReranker(
+        model_name=settings.reranker_model,
+        device=settings.reranker_device,
+        dtype=settings.reranker_dtype,
+        batch_size=settings.reranker_batch_size,
+    )
+    seconds = reranker.preload()
+    print(f"Reranker loaded: {settings.reranker_model} in {seconds:.1f}s")
+    return reranker
 
 
 def _doc_count(app: FastAPI) -> int:

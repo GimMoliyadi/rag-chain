@@ -16,6 +16,7 @@ rag.py 不需要知道底下接的是哪种 API。
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 
 from .config import Settings
 
@@ -25,6 +26,16 @@ class BaseLLM:
 
     def chat(self, messages: list[dict]) -> str:
         raise NotImplementedError
+
+    def chat_stream(self, messages: list[dict]) -> Iterator[str]:
+        """流式版 chat：逐段产出正文。
+
+        默认实现并不真正流式——一次性调用 chat() 然后整段吐出。这样不支持
+        增量输出的实现（MockLLM）不用改就能被流式接口复用；真正支持增量的
+        实现各自覆盖这个方法。调用 chat() 发生在第一次 next() 时，
+        没人消费这个生成器就不会白跑一次请求。
+        """
+        yield self.chat(messages)
 
     @property
     def model_name(self) -> str:
@@ -45,13 +56,28 @@ class OpenAICompatibleLLM(BaseLLM):
     def model_name(self) -> str:
         return self._model
 
+    def _create_kwargs(self, messages: list[dict]) -> dict:
+        """chat() 和 chat_stream() 共用的请求参数，避免两处各写一遍。"""
+        return {
+            "model": self._model,
+            "messages": messages,
+            "temperature": self._temperature,
+        }
+
     def chat(self, messages: list[dict]) -> str:
-        response = self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            temperature=self._temperature,
-        )
+        response = self._client.chat.completions.create(**self._create_kwargs(messages))
         return response.choices[0].message.content or ""
+
+    def chat_stream(self, messages: list[dict]) -> Iterator[str]:
+        with self._client.chat.completions.create(
+            **self._create_kwargs(messages), stream=True
+        ) as stream:
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
 
 
 class AnthropicCompatibleLLM(BaseLLM):
@@ -63,29 +89,66 @@ class AnthropicCompatibleLLM(BaseLLM):
     所以 chat() 先在边界上把 system 条目摘出去再交给 SDK。适配只发生在这一个
     类里，rag.py 完全不用改。
 
-    凭证刻意不走 .env：SDK 的零参构造自己从 ANTHROPIC_BASE_URL /
-    ANTHROPIC_AUTH_TOKEN 解析，token 因此既不进代码也不落盘。这也是能直接复用
-    Claude Code 进程环境的前提。模型 ID 的优先级是构造参数（.env 的 LLM_MODEL）
-    高于 ANTHROPIC_MODEL 环境变量。
+    模型 / 端点 / 凭证的优先级统一为：构造参数（来自 .env 的 LLM_MODEL /
+    LLM_BASE_URL / LLM_API_KEY）优先，进程环境的 ANTHROPIC_MODEL /
+    ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN 兜底。这样既能只靠 .env 独立运行
+    （在 Claude Code 之外的普通终端里也有用），又能继续复用 Claude Code 的进程
+    环境。token 仍然不进代码，只会落在被 gitignore 的 .env 里。
 
     不传 temperature / thinking 这类参数：本端点是第三方兼容代理，只验证过最简
     请求（model + max_tokens + messages），加 Anthropic 专有参数很可能直接 400。
     少传参数就是少一个失败点。
+
+    超时是刻意覆盖的（见 config.py 里 llm_timeout_* 的注释）：connect 是为了
+    连不上时快速失败，total 是给等回答的耗时留余量。上游 LLM 延迟受服务负载、
+    网络和时段影响较大，历史实测数字已经证明不稳定，所以这里不写具体测量值——
+    需要新数字时跑 `python scripts/probe_llm_latency.py`。两个值都可用 .env 配置。
+
+    模型 ID 为空时直接在这里抛，而不是让 SDK 返回一个"缺少 model 参数"的错：
+    后者看不出是配置问题，排查要多绕一层。
     """
 
-    def __init__(self, model: str | None = None, max_tokens: int = 4096) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        max_tokens: int = 4096,
+        timeout_connect: float = 15.0,
+        timeout_total: float = 300.0,
+    ) -> None:
         import anthropic  # 延迟导入，mock / openai 模式下不需要 anthropic
+        from httpx2 import Timeout  # anthropic 自身依赖，不会引入新包
 
-        self._client = anthropic.Anthropic()
+        # 三处遵循同一条优先级：构造参数（.env 显式配置）优先，进程环境兜底。
         self._model = (model or os.environ.get("ANTHROPIC_MODEL", "")).strip()
+        if not self._model:
+            raise ValueError(
+                "AnthropicCompatibleLLM 需要模型 ID：构造参数或 ANTHROPIC_MODEL 都没有。"
+                "请在 .env 的 LLM_MODEL 或进程环境的 ANTHROPIC_MODEL 里填一处。"
+            )
+        self._base_url = (base_url or os.environ.get("ANTHROPIC_BASE_URL", "")).strip()
+        self._auth_token = (api_key or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")).strip()
+
+        # 留空就不传：缺 base_url 时 SDK 走 api.anthropic.com，缺 auth_token 时
+        # SDK 自己读 ANTHROPIC_AUTH_TOKEN。构造本身不校验凭证，因为 SDK 只在
+        # 第一次请求时才真正校验——把校验前置在 config.validate_providers()。
+        client_kwargs: dict[str, object] = {
+            "timeout": Timeout(timeout=timeout_total, connect=timeout_connect)
+        }
+        if self._base_url:
+            client_kwargs["base_url"] = self._base_url
+        if self._auth_token:
+            client_kwargs["auth_token"] = self._auth_token
+        self._client = anthropic.Anthropic(**client_kwargs)
         self._max_tokens = max_tokens
 
     @property
     def model_name(self) -> str:
         return self._model
 
-    def chat(self, messages: list[dict]) -> str:
-        # 拆 system：Anthropic 要求它作顶层参数，messages 里只留 user / assistant。
+    def _split_system(self, messages: list[dict]) -> tuple[str, list[dict]]:
+        """拆 system：Anthropic 要求它作顶层参数，messages 里只留 user / assistant。"""
         system_parts: list[str] = []
         api_messages: list[dict] = []
         for msg in messages:
@@ -93,19 +156,40 @@ class AnthropicCompatibleLLM(BaseLLM):
                 system_parts.append(msg["content"])
             else:
                 api_messages.append({"role": msg["role"], "content": msg["content"]})
+        return "\n\n".join(system_parts), api_messages
 
+    def _create_kwargs(self, messages: list[dict]) -> dict[str, object]:
+        """chat() 和 chat_stream() 共用的请求参数，两处不能各写一份。"""
+        system_text, api_messages = self._split_system(messages)
         create_kwargs: dict[str, object] = {
             "model": self._model,
             "max_tokens": self._max_tokens,
             "messages": api_messages,
         }
-        if system_parts:
-            create_kwargs["system"] = "\n\n".join(system_parts)
+        if system_text:
+            create_kwargs["system"] = system_text
+        return create_kwargs
 
-        response = self._client.messages.create(**create_kwargs)
+    def chat(self, messages: list[dict]) -> str:
+        response = self._client.messages.create(**self._create_kwargs(messages))
         # 响应的 content 是 block 列表，text / thinking / tool_use 混排，
         # 必须按 type 挑，不能假设第一个块就是文本。
         return "".join(block.text for block in response.content if block.type == "text")
+
+    def chat_stream(self, messages: list[dict]) -> Iterator[str]:
+        """流式版：只吐 text_delta 的正文。
+
+        实测这个端点的正文在 content_block_delta / text_delta 里（字段 text），
+        thinking_delta 不带正文，统一跳过。
+        """
+        with self._client.messages.create(
+            **self._create_kwargs(messages), stream=True
+        ) as stream:
+            for event in stream:
+                if event.type != "content_block_delta":
+                    continue
+                if event.delta.type == "text_delta" and event.delta.text:
+                    yield event.delta.text
 
 
 class MockLLM(BaseLLM):
@@ -139,8 +223,14 @@ def get_llm_client(settings: Settings) -> BaseLLM:
             model=settings.llm_model,
         )
     if settings.llm_provider == "anthropic":
+        # 三个 anthropic_* 属性在这里统一取值（.env 优先、进程环境兜底），
+        # 优先级只在这一处解析，实现类不用再各自重复一遍。
         return AnthropicCompatibleLLM(
-            model=settings.llm_model or None,
+            model=settings.anthropic_model or None,
+            base_url=settings.anthropic_base_url or None,
+            api_key=settings.anthropic_api_key or None,
             max_tokens=settings.llm_max_tokens,
+            timeout_connect=settings.llm_timeout_connect,
+            timeout_total=settings.llm_timeout_total,
         )
     return MockLLM()

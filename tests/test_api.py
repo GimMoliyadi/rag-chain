@@ -22,7 +22,7 @@ def test_api_search_ok(client):
     assert body["count"] == len(body["results"])
 
     first = body["results"][0]
-    # 前端展示需要的字段一个都不能少
+    # 调用方需要的字段一个都不能少
     for key in ("rank", "score", "title", "file_path", "heading", "content"):
         assert key in first, f"缺少字段 {key}"
     assert first["rank"] == 1
@@ -46,7 +46,7 @@ def test_api_documents_list_and_detail(client):
     body = detail.json()
     assert body["title"]
     assert body["chunk_count"] > 0
-    assert "content_hash" not in body  # 内部字段不泄漏给前端
+    assert "content_hash" not in body  # 内部字段不泄漏给调用方
 
     assert client.get("/api/documents/999999").status_code == 404
 

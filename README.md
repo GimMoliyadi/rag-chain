@@ -10,7 +10,7 @@
 
 ## 1. 这个项目是什么
 
-一个后端服务，对外提供 HTTP 接口，让你（或未来的前端页面）能向自己的笔记提问。
+日常用法是一个命令行工具 `ask.py`：在终端里直接问自己的笔记，返回带 `[1][2][3]` 引用来源的回答。另外有一组 HTTP 接口，供需要程序化调用的脚本或工具使用——只想要 RAG 动作的话，命令行那条路就够了，不用起服务。
 
 ```
 你的 Obsidian Vault（只读）
@@ -32,7 +32,7 @@
 
 | 库 | 存什么 | 用来干嘛 |
 |---|---|---|
-| SQLite | 原文全文、标题、路径、标签、切块原文 | 精确查询、翻页、给前端展示、备份 |
+| SQLite | 原文全文、标题、路径、标签、切块原文 | 精确查询、翻页、查文档列表、备份 |
 | ChromaDB | 每个 chunk 的向量 | 相似性检索（"意思相近"而不是"字面相同"） |
 
 ChromaDB 是可以随时重建的派生物，SQLite 是唯一的原文来源。删掉 `data/chroma` 重来没有任何损失。
@@ -52,7 +52,7 @@ POST /api/chat  {"question": "什么是 POVM？"}
                                    sources 的 index 和答案里的 [1][2][3] 一一对应
 ```
 
-SQLite 在这条链路上**不直接参与**（检索走 ChromaDB）。它的角色是：原文的唯一存档、增量更新的判据、以及给前端展示文档列表用。
+SQLite 在这条链路上**不直接参与**（检索走 ChromaDB）。它的角色是：原文的唯一存档、增量更新的判据、以及查文档列表用。
 
 ---
 
@@ -68,23 +68,35 @@ obsidian-rag-backend/
 │   ├── embedding.py      Embedding 客户端（可替换）
 │   ├── vectorstore.py    ChromaDB 封装
 │   ├── retriever.py      检索：问题 → Top-K chunk
+│   ├── context_filter.py 过滤导航类 chunk（默认关闭）
+│   ├── reranker.py       cross-encoder 精排（默认关闭）
 │   ├── llm.py            LLM 客户端（可替换）
 │   ├── rag.py            拼 Prompt + 管引用编号 ★最值得读
-│   ├── ingest.py         把上面几步串起来
+│   ├── ingest.py         把上面几步串起来，含删除同步
 │   └── main.py           FastAPI 路由
-├── ingest.py             命令行：导入文档
-├── search.py             命令行：只检索、不调 LLM
-├── scripts/              真实模型验证脚本，都不属于默认 pytest
+├── ingest.py             命令行：导入文档 / 增量更新 ← 构建完知识库后跑这条
+├── search.py             命令行：只检索、不调 LLM（排查检索用）
+├── ask.py                命令行：完整问答 ← 日常入口
+├── eval_retrieval.py     检索评测：Recall@K / MRR
+├── eval_rag.py           端到端问答评测
+├── eval/                 题目集与评测结果（JSON）
+├── RETRIEVAL_BASELINE.md 优化前的成绩基线 + reranker A/B 实测
+├── scripts/              验证与测量脚本，都不属于默认 pytest
 │   ├── diagnose_embedding_determinism.py   Embedding 可复现性诊断（A/B/C/D/E 五组）
 │   ├── smoke_real_embedding.py             真实模型 smoke test
-│   └── retrieval_check.py                  小规模真实检索验证（300 chunk 临时索引）
-├── tests/                85 个测试（全 mock，不加载模型）
+│   ├── retrieval_check.py                  小规模真实检索验证（300 chunk 临时索引）
+│   ├── probe_llm_latency.py                重新测量上游 LLM 延迟（决定 timeout 用）
+│   └── probe_* / trace_* / download_*      其他测量脚本，见目录
+├── tests/                188 个测试（全 mock，不加载模型）
 ├── .env                  你的配置（不要提交到 git）
 ├── .env.example          配置模板
 ├── data/                 运行时生成：knowledge.db + chroma/（已 gitignore）
 ├── README.md
 └── LEARNING_NOTES.md     概念讲解 + 完整调用链
 ```
+
+桌面启动器 `ask.bat` 放在 `C:\Users\<你的用户名>\Desktop\`，双击即用（它写死了项目路径，
+可以放在任何位置运行）。
 
 ---
 
@@ -197,14 +209,54 @@ curl -X POST http://127.0.0.1:8000/api/ingest -H "Content-Type: application/json
 
 ### 增量更新
 
-每篇文档的内容会被算成 sha256 存进 SQLite。再次导入时哈希相同就整篇跳过（不重新切块、不重新算向量、不写数据库）。只修改了某一篇，就只有那一篇会被更新。
+典型用法是：**知识体系构建完成 → 跑一次 `python ingest.py`**。它自动扫描差异，
+不需要常驻后台 watcher，也不需要手动判断哪些文件变了。四种变化分别这样处理：
+
+| 情况 | SQLite | Chroma 向量 | 统计字段 |
+|---|---|---|---|
+| 新文档 | 插入 `documents` + `chunks` | 插入新 chunk 向量 | `added` |
+| 修改文档（含改短） | 先删该文档旧 `chunks`，再插新的 | 先删该文档旧向量，再插新的 | `updated` |
+| 删除文档 | 删 `documents` 行，`chunks` 靠 `ON DELETE CASCADE` 连带删 | 删该文档全部向量 | `removed` |
+| 未变化 | 整篇跳过 | 整篇跳过 | `unchanged` |
+
+**"删除同步"是必须做的一步**，否则会在库里留下「幽灵知识」：笔记在 Obsidian 里已经删了，
+但向量还在，问相关问题时照样被检索出来，回答看起来言之凿凿其实来源已不存在。
+删除顺序是**先删 Chroma 向量、再删 SQLite 行**——这样万一 Chroma 那步失败，SQLite 还没动，
+下次再跑就能干净重试；单篇失败只计入 `failed` / `errors`，不会中断整批。
+
+**两个刻意设计的保护：**
+
+- `--path` / `--limit` 只扫了一部分文件，这时候**无法**判断哪些是「被删了」——
+  没扫到的文件不是被删，只是没看到。所以这两种模式下删除同步自动跳过，
+  并会打印提示。要全库同步，跑一次不带参数的 `python ingest.py`。
+- 文件读不到（权限、临时锁定）不等于文件被删了。读失败的文件不会进入「已见」集合，
+  因此不会被判成删除，它的知识不会凭空消失。
+
+**正文被清空**（只剩 frontmatter）也算一种修改：切块后一个 chunk 都没有，
+这种情况下旧的 chunk 和向量一样要清空，而不是保留。
 
 ```
 第一次：扫描 911  新增 911  未变化跳过 0    写入 chunk 14303
 第二次：扫描 911  新增 0    未变化跳过 911  写入 chunk 0
 ```
 
-这就是"不会因为反复导入而无限重复插入"的实现方式——判据是内容哈希，不是文件修改时间。
+判据是内容 sha256，不是文件修改时间——只改了一行也有哈希变化，会被正确更新；
+反复跑同一批文件不会产生重复插入。
+
+### 重新测量上游 LLM 延迟
+
+LLM 回答慢的时候，先量再决定，别改配置猜：
+
+```bash
+python scripts/probe_llm_latency.py
+```
+
+它会对比「空 prompt」和「RAG 同量级 prompt」两组，帮你区分瓶颈是服务端的固定等待，
+还是输入体量大导致的。
+
+上游 LLM 延迟受服务负载、网络和时段影响较大，历史单次测量已经证明不稳定，
+所以 `.env` 里的 `LLM_TIMEOUT_CONNECT` / `LLM_TIMEOUT_TOTAL` 保持可配置、本轮未改值。
+**建议在多个时段各跑一次**，拿到一组有代表性的数字之后，再决定要不要调整这两个值。
 
 ---
 
@@ -395,7 +447,47 @@ Embedding model mismatch. Please rebuild vector index.
 
 ---
 
-## 9. 启动服务
+## 9. 命令行问答（日常用法）
+
+不启服务，直接在终端问自己的笔记：
+
+```bash
+python ask.py "合同违约需要承担什么责任？"   # 单次问答
+python ask.py --k 8 "什么是 MVP"            # 覆盖检索条数
+python ask.py                               # 交互模式，反复提问
+```
+
+首次运行要加载 bge-m3（权重约 2.17 GB，十几秒），所以先打印一行"正在加载知识库（约十几秒）…"，加载完报一下库里的 chunk 数和本次的 top_k。
+
+输出分两块：
+
+```
+============================================================
+……模型的回答，句末带 [1][2][3] 上标……
+============================================================
+
+引用 3 条 | 耗时 <N> 秒
+
+[1] 相似度 <score>
+    文档：合同法 / 违约责任的承担
+    文件：Documents/Obsidian/…/合同法.md
+    原文：……开头 200 字预览，剩下的自己打开文件看……
+```
+
+耗时和相似度都以你本次实际输出为准：耗时取决于上游 LLM 当时的负载和时段，
+相似度没有统一的合格线（见「评测结果怎么读」）。
+
+`[1][2][3]` 和引用列表的编号严格一一对应——模型编不出检索不到的编号。来源只打印开头 200 字，全文打开对应 `.md` 文件看。
+
+交互模式复用同一个引擎，只加载一次模型，问第二题不用再等十几秒；`exit` 退出。
+
+**答案不对时的排查顺序**：先 `python search.py "问题"` 看检索召回了什么（不花钱、不调 LLM）→ 检索对了再查 LLM 环节。
+
+---
+
+## 10. 启动服务（需要 HTTP 接口时才做）
+
+只想在终端里问问题，上一节就够了，不用起 uvicorn。这一节是给需要程序化调用的脚本或工具用的。
 
 ```bash
 uvicorn app.main:create_app --factory --reload
@@ -418,7 +510,7 @@ uvicorn app.main:create_app --factory --reload
 
 ---
 
-## 10. 测试 RAG
+## 11. 用 HTTP 接口调 RAG
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/chat \
@@ -451,7 +543,13 @@ curl -X POST http://127.0.0.1:8000/api/chat \
 pytest -q
 ```
 
-85 个测试，全部用临时目录造假 Vault 和假数据库，**不碰你的真实 Vault，也不碰 `data/`**。
+188 个测试（刚跑过：`188 passed, 1 warning`），全部用临时目录造假 Vault 和假数据库，**不碰你的真实 Vault，也不碰 `data/`**。
+用项目自带的解释器跑，不要用手边的系统 Python：
+
+```bash
+.venv\Scripts\python.exe -m pytest -q     # Windows
+.venv/bin/python -m pytest -q             # macOS / Linux
+```
 
 **测试不需要下载模型**：`tests/test_embedding_semantic.py` 用 `monkeypatch` 把一个假的 `sentence_transformers` 模块塞进 `sys.modules`，模型加载、编码、归一化全部走假的实现。所以跑测试既快又不耗流量，`LocalSemanticEmbedding` 自己的逻辑（分批、缓存、维度探测、前缀、指纹校验）照样被逐个验证到。
 
@@ -467,6 +565,33 @@ python scripts/retrieval_check.py                  # 300 个真实 chunk 建临�
 
 覆盖的点：Markdown 能读、SQLite 能存、chunk 数量正常、相同文档不会重复写入、Search 能返回相关 chunk、`/health` 正常、`/api/search` 正常，外加切块边界落在句读上、入库后的下标能精确切回原文（`原文[start:end] == chunk`）、引用编号连续、Vault 前后字节完全一致；本地语义 embedding 的分批/单次加载/归一化/查询前缀/设备选择；换模型被检测并报 `EmbeddingMismatchError`；哈希 fallback 和 OpenAI provider 不受影响；`--rebuild-vectors` 只动 Chroma、SQLite 快照前后完全一致。
 
+`tests/test_ingest_sync.py` 专门覆盖增量导入的四种变化（新增 / 修改 / 删除 / 未变化），
+以及三个容易出事的边界：文档改短后旧 chunk 必须清掉、正文被清空后必须清空、
+`--path` / `--limit` 下删除同步必须自动跳过、文件读失败不能被当成已删除。
+
+---
+
+## 评测结果怎么读（重要口径警告）
+
+`eval/retrieval_questions.json` 里有 32 道题，**全部 `verified: false`，还一道都没有人工确认过。**
+
+`eval_retrieval.py` 默认会跳过未确认的题目，所以直接跑会得到 0 道可计分题目，并提示
+「没有可计分的题目」。加 `--all` 可以连未确认的一起算，但那算的是对**我猜测的答案文档**的召回，
+不是对确定 ground truth 的召回。`RETRIEVAL_BASELINE.md` 和 `eval/results/` 下的所有数字
+都是用 `--all` 跑出来的。
+
+因此，在人工确认之前：
+
+- **Recall@K / MRR 只能当作内部实验数据**，用来做同一系统改前改后的相对 A/B 对比；
+  **不能当作正式 ground truth 结果**对外引用或写进结论。
+- 某道题标错了期望文档，那道题的失败会算到系统的头上。这是当前数字最大的不确定性来源。
+- **绝对余弦相似度分数不是统一的质量标准**。0.60 和 0.63 的差距没有意义，
+  同一个分数在不同语料、不同问题上能对应完全不同的检索质量。
+  质量判断以「期望文档是否排在前面 / Recall@K / MRR / 人工读一遍结果」为准，不要拿单次 score 去调参。
+
+确认方式是手动的：读完一道题、对照真实笔记核对期望文档之后，
+把那道题的 `verified` 改成 `true`。这个环节刻意不做自动化——它本来就需要人来判断。
+
 ---
 
 ## 后续优化（本轮刻意不做，不是遗漏）
@@ -477,19 +602,35 @@ python scripts/retrieval_check.py                  # 300 个真实 chunk 建临�
 
 **导航/链接类 chunk 污染 Top-K** —— 真实检索里发现：《Harsanyi-1967-贝叶斯博弈》的「知识库链接」章节（纯 `[[wiki-link]]` 列表，没有实质内容）能排进 Top-5，score 0.5656。这类 chunk 本身是合法内容，只是对问答没价值。可以在入库时按 heading 名过滤，但会丢掉一部分索引，本轮保留原样。
 
-**reranker** —— 全量 14303 chunk 上跑真实检索后，「章节标题同名」的干扰才暴露出来：问 Cournot 竞争时，《柠檬市场》和《Stackelberg竞争》的「模型设定」章节靠通用标题 + 产量相关词排进 Top-2 / Top-3（0.6498 / 0.6285），真正的 Cournot竞争 掉到 #5。300 chunk 的临时索引里没这个问题（语料小、干扰项少），**只有全量规模才看得见**。cross-encoder 只重排 Top-50 成本很低，这是下一轮最划算的改进，本轮刻意没做。
+**reranker（已实现、已实测、默认关闭）** —— 全量 14303 chunk 上跑真实检索后，
+「章节标题同名」的干扰才暴露出来：问 Cournot 竞争时，《柠檬市场》和《Stackelberg竞争》的
+「模型设定」章节靠通用标题 + 产量相关词排进 Top-2 / Top-3，真正的 Cournot竞争 掉到 #5。
+300 chunk 的临时索引里没这个问题（语料小、干扰项少），**只有全量规模才看得见**。
 
-**vault 文档里的 JSON 残留** —— 《纳什均衡存在性定理》的「历史与扩展」章节原文尾部混有 `", "file_path": "/c/Users/30858/Desk…` 这类字段残留。切块器照原样搬运、不清洗：检索排序不受影响（该 chunk 语义命中仍然正确），但内容摘要里能看见。修它要改 vault 原文，而本项目只读 vault，不在本轮范围内。
+于是 `app/reranker.py` 做了出来，并且用 A/B 四组实测过（结果在 `RETRIEVAL_BASELINE.md` 第 10 节）：
+Recall@5 从 0.8077 升到 0.8846，MRR 从 0.6551 升到 0.7500，改善集中在最弱的
+paraphrase / hard_negative 两类；代价是检索耗时 ×41。
 
-**真实 LLM、前端、鉴权** —— 本轮目标是把本地 embedding + Chroma 真实跑通并拿到真实 Top-K，这些一概没做。当前 `/api/chat` 默认走 mock LLM，只回显实际拼好的 Prompt，正好用来核对引用编号和参考资料的拼接是否正确。
+**所以 `RERANKER_ENABLED` 仍然默认 `false`**——理由从「没验证过」变成了
+「验证过、确实有效、但延迟代价和收益不匹配」。需要时把它改成 `true` 即可，
+代码、测试、评测口径都已经就位。换更强排序器也不会解决的下一处是文档层级问题，
+不在本轮范围内。
+
+**vault 文档里的 JSON 残留** —— 《纳什均衡存在性定理》的「历史与扩展」章节原文尾部混有 `", "file_path": "/c/Users/<你的用户名>/Desk…` 这类字段残留。切块器照原样搬运、不清洗：检索排序不受影响（该 chunk 语义命中仍然正确），但内容摘要里能看见。修它要改 vault 原文，而本项目只读 vault，不在本轮范围内。
+
+**鉴权、多用户** —— 接口和命令行都本机直连，没有登录也没有权限划分，不要暴露到公网。Web 界面已按需求删掉，问答入口就是 `ask.py` 和 HTTP 接口这两条。
 
 ## 常见问题
 
 **Q: 答案引用了错误的来源？**
 先跑 `python search.py "你的问题"` 看检索返回了什么。90% 的情况是检索没找到对的 chunk，而不是 LLM 的错。
 
-**Q: 相似度数字都很低（0.2~0.3）？**
-如果用的是 `local` 伪向量，这是正常的，数字没有意义。换成真模型后中文语料上通常 0.3~0.7 属于合理区间。
+**Q: 相似度数字看起来都很低？**
+如果是 `local` 伪向量（`EMBEDDING_PROVIDER=local`），那是哈希出来的假向量，**分数完全没有意义**，
+别拿它当依据。换成真模型后，**绝对分数也没有统一的"合格线"**——同一个分数在不同语料、
+不同问题上可以对应完全不同的检索质量，给不出"0.X 以上就算好"这种判断标准。
+看质量请直接看排名：`python search.py "你的问题"` 看期望的文档排第几，
+或者跑 `eval_retrieval.py` 看 Recall@K / MRR。
 
 **Q: 导入了 900 多篇要多久？**
 全库 911 篇 / 14303 个 chunk。本机实测 `BAAI/bge-m3` 在 RTX 4050 Laptop（6 GB 显存）上用 GPU 跑 `--rebuild-vectors` 重建全量向量 **364.2 秒（约 6 分 4 秒）**，平均 0.03 秒/条，峰值显存 1275 MiB——这个数字已经包含约 40 秒的模型加载时间。平时不用跑：chunk 原文没变时增量导入会整篇跳过，`--rebuild-vectors` 只在换 embedding 模型后才需要。纯 CPU 上会明显更慢，但本项目没在 CPU 上实测过，不给数字。`EMBEDDING_BATCH_SIZE` 默认 **8** 就是实测取的值，显存紧张才往下调，不建议调更大。

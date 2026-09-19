@@ -240,35 +240,34 @@ FastAPI 不是 RAG 的一部分，它是**把上面所有东西包成 HTTP 接�
 3. **格式化输出** —— 把 Python 对象变成 JSON
 4. **生成文档** —— `/docs` 页面是自动生成的，改代码就自动更新
 
-### 未来的前端怎么调用这个后端
+### 可选的接口调用方式
 
-前端的角色：**发请求 → 拿 JSON → 渲染成界面**。它完全不知道 RAG、embedding、ChromaDB 是什么。
+**这个项目的日常入口是命令行**：`ask.py` 问答、`ingest.py` 导入。HTTP 接口是可选的，
+不启动它项目照样能用，所以不要把它理解成「必须配一个前端才能用」。
+
+如果确实想从别的程序调用（脚本、另一个后端、你自己的工具），可以直接发 HTTP 请求：
 
 ```javascript
-// 用户在输入框里打了 "什么是 POVM？"，点发送
+// 先启动： uvicorn app.main:app
 const res = await fetch("http://127.0.0.1:8000/api/chat", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ question: "什么是 POVM？", top_k: 5 })
 });
 const { answer, sources } = await res.json();
-
-// 渲染答案（answer 里带 [1][2][3] 上标）
-// 渲染引用列表，用 sources 数组
-sources.forEach(s => {
-  引用列表.push(`[${s.index}] ${s.title} / ${s.heading}  （${s.score.toFixed(2)}）`);
-});
+// answer 里带 [1][2][3] 上标，sources 是和它对应的引用列表
 ```
 
-后端返回的 `sources` 数组就是为这个场景设计的：每条有 `index`（和答案里的编号对应）、`title`、`file_path`、`heading`、`score`、`chunk`（原文）。前端可以直接把它做成"点击引用跳到对应笔记"的功能——`file_path` 就是 Obsidian 里能定位到的路径。
+`sources` 里每条有 `index`（和答案里的编号对应）、`title`、`file_path`、`heading`、`score`、`chunk`（原文）。
+`file_path` 就是 Obsidian 里能定位到的路径，可以拿它做「点击引用跳到对应笔记」。
 
-其他接口给前端的用途：
+其余接口的用途：
 
-- `GET /api/documents` —— 做"我的知识库"列表页（分页）
-- `GET /api/documents/{id}` —— 做单篇笔记详情页
-- `GET /api/search` —— 做"检索调试面板"，让不懂 LLM 的人也能验证检索效果
-- `POST /api/ingest` —— 做"重新导入"按钮
-- `GET /health` —— 做页面顶部的状态灯
+- `GET /api/documents` —— 列出已导入的文档（分页）
+- `GET /api/documents/{id}` —— 单篇详情
+- `GET /api/search` —— 只检索、不调 LLM，排查检索效果用
+- `POST /api/ingest` —— 等价于跑一次 `ingest.py`
+- `GET /health` —— 探活
 
 ---
 

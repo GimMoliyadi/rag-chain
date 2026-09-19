@@ -18,7 +18,14 @@ openai>=1.40
 # Anthropic Messages API 的官方 SDK（LLM_PROVIDER=anthropic 时用）
 # 零参构造会自动从 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN 解析凭证，
 # 所以这个 provider 不需要把 token 写进 .env。
-anthropic>=1.0
+#
+# 这里 pin 死而不是写 >=，因为本项目用到两个 1.x 才稳定的行为：
+#   1. 零参构造时从进程环境解析 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
+#      （凭证不落 .env 这件事完全依赖它）
+#   2. httpx2.Timeout(timeout=..., connect=...) 会原样透传到底层客户端，
+#      这是覆盖 SDK 默认 connect=5.0s 的唯一入口
+# 另外 DefaultHttpxClient 这个公开类在 1.x 里才存在，0.x 的写法不一样。
+anthropic==1.6.0
 
 # 配置解析：YAML frontmatter
 pyyaml>=6.0
