@@ -10,7 +10,13 @@
 
 ## 1. 这个项目是什么
 
-日常用法是一个命令行工具 `ask.py`：在终端里直接问自己的笔记，返回带 `[1][2][3]` 引用来源的回答。另外有一组 HTTP 接口，供需要程序化调用的脚本或工具使用——只想要 RAG 动作的话，命令行那条路就够了，不用起服务。
+三条入口，底层共用同一个 `RAGEngine`（装配代码集中在 `app/engine.py`，三份入口不再有各自的拷贝）：
+
+- **`ask.py` 命令行**——日常用法，在终端里直接问自己的笔记，返回带 `[1][2][3]` 引用来源的回答；
+- **`mcp_server.py` MCP 服务器**——让 Claude Code 在对话里直接检索你的知识库，见第 12 节；
+- **FastAPI HTTP 接口**——供需要程序化调用的脚本或工具使用。
+
+只想要 RAG 动作的话，命令行那条路就够了，不用起服务。
 
 ```
 你的 Obsidian Vault（只读）
@@ -68,15 +74,25 @@ obsidian-rag-backend/
 │   ├── embedding.py      Embedding 客户端（可替换）
 │   ├── vectorstore.py    ChromaDB 封装
 │   ├── retriever.py      检索：问题 → Top-K chunk
+│   ├── router.py         知识域路由：先判断属于哪个域，再限定检索范围
+│   ├── knowledge_domains.py 读域映射表和路由术语表（都在 config/ 下的 YAML）
 │   ├── context_filter.py 过滤导航类 chunk（默认关闭）
 │   ├── reranker.py       cross-encoder 精排（默认关闭）
 │   ├── llm.py            LLM 客户端（可替换）
+│   ├── evidence.py       证据门控：回答前判定资料够不够
+│   ├── personal_context.py 读个人上下文，供 advisor 模式注入
 │   ├── rag.py            拼 Prompt + 管引用编号 ★最值得读
+│   ├── engine.py         装配 RAGEngine：CLI / HTTP / MCP 三个入口共用
 │   ├── ingest.py         把上面几步串起来，含删除同步
 │   └── main.py           FastAPI 路由
+├── config/
+│   └── knowledge_domains.yaml 知识域映射 + router_terms 路由术语（改归类只动这里）
+├── personal_context/     context.yaml 是你的私有上下文（已 gitignore，不进库）
+│                         example.yaml 是同构模板，进库
 ├── ingest.py             命令行：导入文档 / 增量更新 ← 构建完知识库后跑这条
 ├── search.py             命令行：只检索、不调 LLM（排查检索用）
 ├── ask.py                命令行：完整问答 ← 日常入口
+├── mcp_server.py         MCP 服务器：让 Claude Code 在对话里直接检索
 ├── eval_retrieval.py     检索评测：Recall@K / MRR
 ├── eval_rag.py           端到端问答评测
 ├── eval/                 题目集与评测结果（JSON）
@@ -87,7 +103,7 @@ obsidian-rag-backend/
 │   ├── retrieval_check.py                  小规模真实检索验证（300 chunk 临时索引）
 │   ├── probe_llm_latency.py                重新测量上游 LLM 延迟（决定 timeout 用）
 │   └── probe_* / trace_* / download_*      其他测量脚本，见目录
-├── tests/                188 个测试（全 mock，不加载模型）
+├── tests/                298 个测试（全 mock，不加载模型）
 ├── .env                  你的配置（不要提交到 git）
 ├── .env.example          配置模板
 ├── data/                 运行时生成：knowledge.db + chroma/（已 gitignore）
@@ -537,13 +553,56 @@ curl -X POST http://127.0.0.1:8000/api/chat \
 
 ---
 
+## 12. 在 Claude Code 里直接问（MCP）
+
+`mcp_server.py` 是第三条入口：Claude Code 把它当成自己的一个 MCP 工具服务器，你在对话里提问时它可以自己检索你的知识库，不需要你打开终端或起 uvicorn。
+
+```bash
+claude mcp add --scope user obsidian-rag -- \
+    "C:\Users\<你的用户名>\obsidian-rag-backend\.venv\Scripts\python.exe" \
+    "C:\Users\<你的用户名>\obsidian-rag-backend\mcp_server.py"
+
+claude mcp get obsidian-rag     # 确认 Status: √ Connected
+```
+
+暴露两个工具，都只读：
+
+| 工具 | 用途 |
+|---|---|
+| `ask` | 自然语言提问，返回带引用来源的答案。默认用它。 |
+| `search` | 只检索不调 LLM，返回最相近的原文片段。用来排查"答案来源不对"或想直接看笔记原文。 |
+
+**为什么没有 ingest 工具？** 因为读和写要分开：MCP 里开 ingest 等于让 AI 在对话里随手改你的知识库。改知识库必须显式跑 `python ingest.py`。
+
+### 首次调用会很慢，这是故意的
+
+模型加载是懒的，不在进程启动时做。原因是 MCP 握手有 **30 秒超时**，而 bge-m3 权重要十几秒起：把加载放在启动阶段，Claude Code 会直接判定 `connection timed out after 30000ms`，整个服务器连不上。
+
+本机实测三段耗时（RTX 4050 Laptop，首次冷启动）：
+
+| 阶段 | 耗时 |
+|---|---|
+| 进程启动 → 握手应答 | **4.94 秒**（远低于 30 秒上限） |
+| 第一次工具调用（含 bge-m3 加载） | **89.7 秒** |
+| 第二次工具调用（模型已驻留） | **0.11 秒** |
+
+代价就是第一问要等约一分钟。之后同一个进程里反复问都不再加载——和 `ask.py` 交互模式复用同一个引擎是同一个道理。
+
+`search` 工具默认走知识域路由（`ask.py` / `search.py` 命令行不默认开，因为终端里可以加 `--router` 自己决定）：不加路由的话，问"海因里希法则"会被量子力学的相似词（变分法、绝热近似）挤到前面，检索到完全无关的领域。这条行为有个测试守着——`tests/test_mcp_server.py::test_routed_domains_*`。
+
+### 证据不足的警告不会被吃掉
+
+`ask` 判定证据不足时，返回文本的**第一行**就是"警告：知识库不足以回答这个问题"，并明确禁止基于那些语义相近的资料编造。这是本项目立 evidence gate 的全部意义：不把这条信息带给调用方，Claude 就会拿相近资料当依据往下编。
+
+---
+
 ## 运行测试
 
 ```bash
 pytest -q
 ```
 
-188 个测试（刚跑过：`188 passed, 1 warning`），全部用临时目录造假 Vault 和假数据库，**不碰你的真实 Vault，也不碰 `data/`**。
+298 个测试（刚跑过：`298 passed, 1 warning`），全部用临时目录造假 Vault 和假数据库，**不碰你的真实 Vault，也不碰 `data/`**。
 用项目自带的解释器跑，不要用手边的系统 Python：
 
 ```bash

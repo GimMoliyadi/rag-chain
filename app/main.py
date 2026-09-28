@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Literal
@@ -22,15 +22,12 @@ from pydantic import BaseModel, Field
 
 from .config import Settings
 from .database import connect, get_document, init_db, list_documents
-from .evidence import EvidenceGate
 from .embedding import BaseEmbedding, get_embedding_client
+from .engine import build_engine
 from .ingest import IngestStats, run_ingest
-from .knowledge_domains import load_router
 from .llm import BaseLLM, get_llm_client
-from .personal_context import PersonalContext, load_personal_context
-from .rag import MODE_NORMAL, RAGEngine, source_to_dict
-from .reranker import CrossEncoderReranker
-from .retriever import EmbeddingMismatchError, Retriever
+from .rag import MODE_NORMAL, source_to_dict
+from .retriever import EmbeddingMismatchError
 from .vectorstore import ChromaStore
 
 
@@ -42,62 +39,17 @@ def create_app(
 ) -> FastAPI:
     """构造一个 FastAPI 应用。所有依赖都在这里组装，端点里不再 new 东西。"""
     settings = settings or Settings()
-    settings.validate_providers()
 
-    # 组装依赖链：embedding/store 是底层，retriever 和 rag 建立在其上
+    # /health 要报模型名，所以 HTTP 层自己解析出 embedding / llm 实例；
+    # 同时注入 build_engine，避免它在内部再构造一份。
     embedding = embedding or get_embedding_client(settings)
-    store = store or ChromaStore(settings.chroma_path_resolved)
     llm = llm or get_llm_client(settings)
+
+    # RAG 链路的组装统一在 app.engine（ask.py 和 mcp_server.py 共用同一份）。
+    # 这里只额外开 SQLite 连接：HTTP 层要查文档列表和分页，SQLite 不参与检索。
+    engine, store = build_engine(settings, embedding=embedding, store=store, llm=llm)
     conn = connect(settings.db_path_resolved)
     init_db(conn)
-
-    retriever = Retriever(embedding=embedding, store=store, default_top_k=settings.top_k)
-    # Advisor 层：Router（规则术语表）+ Evidence Gate（开关关闭时不构造，
-    # 与 reranker 同一纪律——关着的时候一个字节资源都不该占）。
-    # RAGEngine 只在对应开关开启时表现出新行为，关闭时与历史版本完全一致。
-    router, allowed_domains = load_router(settings.knowledge_domains_path_resolved)
-    evidence_gate = (
-        EvidenceGate(llm, chunk_chars=settings.evidence_judge_chunk_chars)
-        if settings.evidence_gate_enabled
-        else None
-    )
-    # Evidence Rescue 用独立的 Retriever：主检索器可能开着 diversity 的
-    # 「每文档最多 N chunk」限额，而救援候选池必须不带这个限额，
-    # 否则「答案在同文档第 3 个 chunk」这类 FN 会被限额挤掉、救援失效。
-    rescue_retriever = None
-    if settings.evidence_gate_enabled and settings.evidence_rescue_enabled:
-        rescue_retriever = Retriever(
-            embedding=embedding, store=store, default_top_k=settings.evidence_rescue_k,
-        )
-    # Personal Context 每次 advisor 请求全量读取一次：文件小，而且它是
-    # 「当前状态」，缓存会让用户在文件里改了内容却看不到生效。
-    personal_context_loader: Callable[[], PersonalContext] | None = None
-    if settings.personal_context_enabled:
-        personal_context_path = settings.personal_context_path_resolved
-
-        def _load_personal_context() -> PersonalContext:
-            return load_personal_context(personal_context_path)
-
-        personal_context_loader = _load_personal_context
-
-    engine = RAGEngine(
-        retriever=retriever,
-        llm=llm,
-        top_k=settings.top_k,
-        vault_name=settings.vault_name,
-        context_filter_enabled=settings.context_filter_enabled,
-        filter_retrieve_top_k=settings.filter_retrieve_top_k,
-        reranker=_build_reranker(settings),
-        reranker_candidate_top_k=settings.reranker_candidate_top_k,
-        router=router,
-        router_domains=allowed_domains,
-        llm_router_fallback_enabled=settings.llm_router_fallback_enabled,
-        evidence_gate=evidence_gate,
-        evidence_rescue_enabled=settings.evidence_rescue_enabled,
-        evidence_rescue_k=settings.evidence_rescue_k,
-        rescue_retriever=rescue_retriever,
-        personal_context_loader=personal_context_loader,
-    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -123,7 +75,7 @@ def create_app(
     app.state.embedding = embedding
     app.state.store = store
     app.state.llm = llm
-    app.state.retriever = retriever
+    app.state.retriever = engine.retriever
     app.state.rag = engine
 
     _register_routes(app)
@@ -262,25 +214,6 @@ class ChatRequest(BaseModel):
 class IngestRequest(BaseModel):
     path_filter: str | None = Field(default=None, description="只导入路径包含该片段的文件，如 '01-精益创业2.0'")
     limit: int | None = Field(default=None, ge=1, le=5000, description="最多导入多少篇，用于小规模试跑")
-
-
-def _build_reranker(settings: Settings) -> CrossEncoderReranker | None:
-    """只有显式开启精排时才构造并加载模型，关着的时候一个字节显存都不占。
-
-    在 create_app 里同步加载而不是留到第一个请求上：加载一次约 7 秒
-    （393 个分片），留到请求上会表现为第一次问答莫名多等 7 秒。
-    """
-    if not settings.reranker_enabled:
-        return None
-    reranker = CrossEncoderReranker(
-        model_name=settings.reranker_model,
-        device=settings.reranker_device,
-        dtype=settings.reranker_dtype,
-        batch_size=settings.reranker_batch_size,
-    )
-    seconds = reranker.preload()
-    print(f"Reranker loaded: {settings.reranker_model} in {seconds:.1f}s")
-    return reranker
 
 
 def _doc_count(app: FastAPI) -> int:

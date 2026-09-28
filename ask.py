@@ -14,14 +14,10 @@ import argparse
 import time
 
 from app.config import Settings
-from app.embedding import get_embedding_client
-from app.evidence import EvidenceGate, STATUS_INSUFFICIENT
-from app.knowledge_domains import load_router
-from app.llm import get_llm_client
+from app.engine import build_engine
+from app.evidence import STATUS_INSUFFICIENT
 from app.personal_context import load_personal_context
 from app.rag import RAGAnswer, RAGEngine
-from app.retriever import Retriever
-from app.vectorstore import ChromaStore
 
 # 终端里引用来源只展示开头这么多字符，剩下的让用户自己打开文件看
 SOURCE_PREVIEW_CHARS = 200
@@ -31,51 +27,6 @@ EXIT_WORDS = {"exit", "quit", "q"}
 
 # 终端分隔线宽度，跟 search.py 保持一致
 LINE_WIDTH = 60
-
-
-def build_engine(settings: Settings) -> tuple[RAGEngine, ChromaStore]:
-    """按 .env 组装完整链路：embedding → 向量库 → 检索器 → Router → RAG 引擎。
-
-    Router 始终注入 RAGEngine（规则路由本身零成本）；LLM fallback 和 Evidence
-    Gate 是否真正生效由 .env 的两个开关决定，关闭时 RAGEngine 不会走那些分支。
-    一并返回 store 是让调用方能读 chunk 总数、退出时 close。store 内部握着
-    Chroma 的 SQLite handle，不关的话进程退出时会留下锁文件。
-    """
-    embedding = get_embedding_client(settings)
-    store = ChromaStore(settings.chroma_path_resolved)
-    retriever = Retriever(embedding=embedding, store=store, default_top_k=settings.top_k)
-    router, allowed_domains = load_router(settings.knowledge_domains_path_resolved)
-    evidence_gate = None
-    if settings.evidence_gate_enabled:
-        evidence_gate = EvidenceGate(
-            get_llm_client(settings), chunk_chars=settings.evidence_judge_chunk_chars,
-        )
-    # 救援用独立的检索器，不带 diversity 的每文档限额（原因见 RAGEngine._rescue_collect）
-    rescue_retriever = None
-    if settings.evidence_gate_enabled and settings.evidence_rescue_enabled:
-        rescue_retriever = Retriever(
-            embedding=embedding, store=store, default_top_k=settings.evidence_rescue_k,
-        )
-    personal_context_loader = None
-    if settings.personal_context_enabled:
-        pc_path = settings.personal_context_path_resolved
-        personal_context_loader = lambda: load_personal_context(pc_path)
-
-    engine = RAGEngine(
-        retriever=retriever,
-        llm=get_llm_client(settings),
-        top_k=settings.top_k,
-        vault_name=settings.vault_name,
-        router=router,
-        router_domains=allowed_domains,
-        llm_router_fallback_enabled=settings.llm_router_fallback_enabled,
-        evidence_gate=evidence_gate,
-        evidence_rescue_enabled=settings.evidence_rescue_enabled,
-        evidence_rescue_k=settings.evidence_rescue_k,
-        rescue_retriever=rescue_retriever,
-        personal_context_loader=personal_context_loader,
-    )
-    return engine, store
 
 
 def ask_once(engine: RAGEngine, question: str, top_k: int, mode: str) -> None:
@@ -183,7 +134,6 @@ def main() -> None:
         raise SystemExit("--k 必须是正整数")
 
     settings = Settings()
-    settings.validate_providers()
     top_k = args.k or settings.top_k
 
     # bge-m3 权重 2.17 GB，加载要十几秒。先给一行提示，

@@ -229,6 +229,25 @@ class RAGEngine:
         """精排的观测数据；未启用精排时为 None。A/B 表里的耗时增量从这里取。"""
         return self._reranker.stats if self._reranker is not None else None
 
+    @property
+    def retriever(self) -> Retriever:
+        """只读访问内部检索器。
+
+        /api/search 和 MCP 的 search 工具只做检索、不调 LLM——这是本项目排查
+        检索问题的固定入口。走这个 property 而不是让调用方自己 new 一个
+        Retriever，是为了避免多持有一份 Chroma 连接，也让检索参数和问答
+        路径始终一致。
+        """
+        return self._retriever
+
+    @property
+    def router(self) -> object | None:
+        """只读访问路由器，和 retriever 的用途一样：让只检索的入口也能按
+        知识域过滤候选。不过滤的话「海因里希法则」会被量子力学的相似词
+        （变分法、绝热近似）挤到前面，检索到完全无关的领域。
+        """
+        return self._router
+
     def answer(
         self,
         question: str,

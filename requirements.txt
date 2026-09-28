@@ -51,6 +51,11 @@ sentence-transformers==6.0.1
 # 有 NVIDIA 显卡想跑 CUDA，需要额外装一次官方 CUDA 版（命令见 README）
 # 本项目没有直接 import transformers，它只作为 sentence-transformers 的传递依赖。
 
+# MCP 服务器：让 Claude Code 在对话里直接检索知识库（见 mcp_server.py）
+# 下限写 2.2 而不是 >=1：2.x 把 v1 的 FastMCP 改名为 MCPServer，本项目用的是
+# 2.x 的 `from mcp.server.mcpserver import MCPServer`，1.x 没有这条 import 路径。
+mcp>=2.2
+
 # 测试
 pytest>=8.0
 httpx>=0.27
