@@ -9,10 +9,16 @@ data/
 *.pem
 *.key
 
+# 真实的个人上下文（身份、目标、项目状态、卡点）；进库的只有同构的 personal_context/example.yaml
+personal_context/context.yaml
+
 # 评测原始结果：检索命中路径暴露私人知识库结构，rag 结果里还有 LLM 依据知识库
 # 生成的完整答案。结论已经固化在 README / RETRIEVAL_BASELINE.md 的汇总表里，
 # 原始 JSON 留在本地做追溯用，不进版本库。
 eval/results/
+
+# 评测脚本 --out 导出的原始报告：内容同 eval/results/，检索命中路径暴露私人知识库结构
+eval/regression_raw_*.json
 
 # 真实题集：32 道题面 + expected_documents 暴露私人知识库的目录结构。
 # 进库的只有同构的 eval/retrieval_questions.example.json（5 道虚构题，只做 schema 说明）。
