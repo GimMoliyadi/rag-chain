@@ -73,6 +73,69 @@ def test_api_chat_rejects_empty_question(client):
     assert client.post("/api/chat", json={"question": ""}).status_code == 422
 
 
+def test_api_chat_rejects_unknown_mode(client):
+    assert client.post("/api/chat", json={"question": "问题", "mode": "advisior"}).status_code == 422
+
+
+def test_api_chat_advisor_reports_mode_and_missing_personal_context(client):
+    """PERSONAL_CONTEXT_ENABLED 默认 false：advisor 照常回答，
+    但 personal_context 明确报告未启用，而不是静默假装没有这一栏。"""
+    r = client.post("/api/chat", json={"question": "合同违约了该怎么处理？", "mode": "advisor"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mode"] == "advisor"
+    assert body["personal_context"] == {"loaded": False, "reason": "Personal Context 未启用"}
+    assert body["answer"].strip()
+
+
+def test_api_chat_normal_keeps_personal_context_unset(client):
+    r = client.post("/api/chat", json={"question": "合同违约了该怎么处理？", "mode": "normal"})
+
+    body = r.json()
+    assert body["mode"] == "normal"
+    assert body["personal_context"] is None
+
+
+def test_api_chat_advisor_loads_personal_context(settings, ingested, tmp_path):
+    """从文件读到 Personal Context 后真正进 Prompt：端到端验证 app 的装配链路。"""
+    from fastapi.testclient import TestClient
+
+    from app.config import Settings
+    from app.main import create_app
+
+    context_path = tmp_path / "context.yaml"
+    context_path.write_text(
+        "profile:\n  current_direction: AI 应用开发\n"
+        "projects:\n  - name: 观察项目\n    status: 进行中\n",
+        encoding="utf-8",
+    )
+    live = Settings(
+        vault_path=settings.vault_path,
+        db_path=settings.db_path,
+        chroma_path=settings.chroma_path,
+        embedding_provider="local",
+        llm_provider="mock",
+        top_k=5,
+        vault_name="测试知识库",
+        personal_context_enabled=True,
+        personal_context_path=str(context_path),
+    )
+    app = create_app(settings=live, embedding=ingested[1], store=ingested[0])
+
+    with TestClient(app) as c:
+        r = c.post("/api/chat", json={"question": "我目前主要方向是什么？", "mode": "advisor"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mode"] == "advisor"
+    info = body["personal_context"]
+    assert info["loaded"] is True
+    assert info["available_sections"] == ["profile", "projects"]
+    assert info["project_count"] == 1
+    assert info["warnings"] == []
+
+
 def test_api_ingest_reports_stats(client, settings):
     r = client.post("/api/ingest", json={})
     assert r.status_code == 200

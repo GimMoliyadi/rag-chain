@@ -15,7 +15,10 @@ import time
 
 from app.config import Settings
 from app.embedding import get_embedding_client
+from app.evidence import EvidenceGate, STATUS_INSUFFICIENT
+from app.knowledge_domains import load_router
 from app.llm import get_llm_client
+from app.personal_context import load_personal_context
 from app.rag import RAGAnswer, RAGEngine
 from app.retriever import Retriever
 from app.vectorstore import ChromaStore
@@ -31,39 +34,104 @@ LINE_WIDTH = 60
 
 
 def build_engine(settings: Settings) -> tuple[RAGEngine, ChromaStore]:
-    """按 .env 组装完整链路：embedding → 向量库 → 检索器 → RAG 引擎。
+    """按 .env 组装完整链路：embedding → 向量库 → 检索器 → Router → RAG 引擎。
 
+    Router 始终注入 RAGEngine（规则路由本身零成本）；LLM fallback 和 Evidence
+    Gate 是否真正生效由 .env 的两个开关决定，关闭时 RAGEngine 不会走那些分支。
     一并返回 store 是让调用方能读 chunk 总数、退出时 close。store 内部握着
     Chroma 的 SQLite handle，不关的话进程退出时会留下锁文件。
     """
     embedding = get_embedding_client(settings)
     store = ChromaStore(settings.chroma_path_resolved)
     retriever = Retriever(embedding=embedding, store=store, default_top_k=settings.top_k)
+    router, allowed_domains = load_router(settings.knowledge_domains_path_resolved)
+    evidence_gate = None
+    if settings.evidence_gate_enabled:
+        evidence_gate = EvidenceGate(
+            get_llm_client(settings), chunk_chars=settings.evidence_judge_chunk_chars,
+        )
+    # 救援用独立的检索器，不带 diversity 的每文档限额（原因见 RAGEngine._rescue_collect）
+    rescue_retriever = None
+    if settings.evidence_gate_enabled and settings.evidence_rescue_enabled:
+        rescue_retriever = Retriever(
+            embedding=embedding, store=store, default_top_k=settings.evidence_rescue_k,
+        )
+    personal_context_loader = None
+    if settings.personal_context_enabled:
+        pc_path = settings.personal_context_path_resolved
+        personal_context_loader = lambda: load_personal_context(pc_path)
+
     engine = RAGEngine(
         retriever=retriever,
         llm=get_llm_client(settings),
         top_k=settings.top_k,
         vault_name=settings.vault_name,
+        router=router,
+        router_domains=allowed_domains,
+        llm_router_fallback_enabled=settings.llm_router_fallback_enabled,
+        evidence_gate=evidence_gate,
+        evidence_rescue_enabled=settings.evidence_rescue_enabled,
+        evidence_rescue_k=settings.evidence_rescue_k,
+        rescue_retriever=rescue_retriever,
+        personal_context_loader=personal_context_loader,
     )
     return engine, store
 
 
-def ask_once(engine: RAGEngine, question: str, top_k: int) -> None:
-    """跑一次完整 RAG，把答案和引用来源打印到终端。"""
+def ask_once(engine: RAGEngine, question: str, top_k: int, mode: str) -> None:
+    """跑一次完整 RAG，把答案、路由决策、证据评审和引用来源打印到终端。"""
     started = time.perf_counter()
     print("正在检索知识库并生成回答…")
-    result = engine.answer(question, top_k=top_k)
+    result = engine.answer(question, top_k=top_k, mode=mode)
     elapsed = time.perf_counter() - started
 
     print("\n" + "=" * LINE_WIDTH)
     print(result.answer)
     print("=" * LINE_WIDTH)
+    print_advisor_info(result)
     print_sources(result, elapsed)
 
 
+def print_advisor_info(result: RAGAnswer) -> None:
+    """打印 Router / Evidence Gate / 证据救援 / Personal Context / 各阶段耗时。
+
+    打印而不是藏在 debug 日志里：CLI 的用途之一就是真实测试时人眼核对
+    每个阶段发生了什么，延迟数字直接印出来才不会被质疑「掩盖开销」。
+    """
+    if result.route is not None:
+        print(f"\n[router] mode={result.route.mode} domains={result.route.domains} "
+              f"origin={result.route.origin} confidence={result.route.confidence:.2f}")
+        print(f"[router] reason: {result.route.reason}")
+    if result.personal_context is not None:
+        info = result.personal_context
+        state = (
+            "、".join(info.get("available_sections") or [])
+            if info.get("loaded") else (info.get("error") or info.get("reason") or "无内容")
+        )
+        print(f"[personal_context] 来源：{info.get('source_path')} 段：{state}")
+    if result.evidence is not None:
+        print(f"[evidence] status={result.evidence.status} confidence={result.evidence.confidence:.2f}"
+              + ("（Judge 失败兜底，非真实评审）" if result.evidence.debug.get("judge_error") else ""))
+        if result.evidence.knowledge_support is not None:
+            print(f"[evidence] 知识库支撑={result.evidence.knowledge_support} "
+                  f"个人状态支撑={result.evidence.personal_context_support}"
+                  + ("（规则改判 insufficient→partial）" if result.evidence.debug.get("status_adjusted") else ""))
+        print(f"[evidence] reason: {result.evidence.reason}")
+    if result.timings:
+        parts = [f"{name}={value}" for name, value in result.timings.items()]
+        print("[timings] " + " | ".join(parts))
+
+
 def print_sources(result: RAGAnswer, elapsed: float) -> None:
-    """打印引用来源，编号和答案里的 [1][2] 一一对应。"""
-    print(f"\n引用 {result.used_chunks} 条 | 耗时 {elapsed:.1f} 秒")
+    """打印引用来源，编号和答案里的 [1][2] 一一对应。
+
+    证据评审判定 insufficient 时，这些来源只是语义相近的候选，
+    必须打上「不可作为答案依据」的标记，避免读者误当成支撑材料。
+    """
+    source_note = ""
+    if result.evidence is not None and result.evidence.status == STATUS_INSUFFICIENT:
+        source_note = "（语义相近资料，不足以作为答案依据）"
+    print(f"\n引用 {result.used_chunks} 条{source_note} | 耗时 {elapsed:.1f} 秒")
     for source in result.sources:
         heading = f" / {source.heading}" if source.heading else ""
         content = source.content
@@ -78,7 +146,7 @@ def print_sources(result: RAGAnswer, elapsed: float) -> None:
         print(f"    原文：{preview}")
 
 
-def repl(engine: RAGEngine, top_k: int) -> None:
+def repl(engine: RAGEngine, top_k: int, mode: str) -> None:
     """交互模式：反复提问，同一个 engine 只加载一次模型。
 
     如果每次提问都新起进程，bge-m3 那 2.17 GB 权重每问一次就要重新加载十几秒，
@@ -95,7 +163,7 @@ def repl(engine: RAGEngine, top_k: int) -> None:
             continue
         if question.lower() in EXIT_WORDS:
             return
-        ask_once(engine, question, top_k)
+        ask_once(engine, question, top_k, mode)
 
 
 def main() -> None:
@@ -105,6 +173,10 @@ def main() -> None:
     )
     parser.add_argument("question", nargs="?", help="要问的问题；不填则进入交互模式")
     parser.add_argument("--k", type=int, default=None, help="检索条数，默认用 .env 里的 TOP_K")
+    parser.add_argument(
+        "--mode", choices=("normal", "advisor"), default="normal",
+        help="advisor 模式读取 personal_context/context.yaml 作为「用户当前情况」",
+    )
     args = parser.parse_args()
 
     if args.k is not None and args.k < 1:
@@ -122,13 +194,23 @@ def main() -> None:
     if count == 0:
         store.close()
         raise SystemExit("向量库是空的，先运行 python ingest.py 导入文档")
-    print(f"向量库已有 {count} 个 chunk，检索条数 top_k={top_k}\n")
+    print(f"向量库已有 {count} 个 chunk，检索条数 top_k={top_k}")
+    if args.mode == "advisor":
+        pc_path = settings.personal_context_path_resolved
+        context = load_personal_context(pc_path)
+        if context.has_content:
+            print(f"mode=advisor，已读取 Personal Context：{pc_path}"
+                  f"（{'、'.join(context.available_sections)}）")
+        else:
+            print(f"mode=advisor，但没有可用的 Personal Context（{pc_path}）——"
+                  "回答时会明确说明缺少用户的当前情况")
+    print()
 
     try:
         if args.question:
-            ask_once(engine, args.question, top_k)
+            ask_once(engine, args.question, top_k, args.mode)
         else:
-            repl(engine, top_k)
+            repl(engine, top_k, args.mode)
     finally:
         store.close()
 

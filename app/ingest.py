@@ -36,6 +36,7 @@ from .database import (
     upsert_document,
 )
 from .embedding import BaseEmbedding
+from .knowledge_domains import DomainInfo, load_domain_mapping, resolve_domain
 from .parser import ParsedDocument, iter_markdown_files, parse_markdown
 from .vectorstore import ChromaStore
 
@@ -221,13 +222,16 @@ def ingest_vault(
     files = iter_markdown_files(settings.vault_path_resolved, path_filter=path_filter, limit=limit)
     stats.scanned = len(files)
 
+    # 映射表整轮只读一次：900 多个文件每个都读一遍 YAML 是纯浪费
+    domain_mapping = load_domain_mapping(settings.knowledge_domains_path_resolved)
+
     # 记录这次扫描在磁盘上真正看到的相对路径。必须在 try 之外加：
     # 一个文件读失败不代表它被删了，不能因此清掉它已有的知识。
     seen_paths: set[str] = set()
     for path in files:
         seen_paths.add(path.relative_to(settings.vault_path_resolved).as_posix())
         try:
-            _ingest_one(settings, embedding, store, conn, path, stats)
+            _ingest_one(settings, embedding, store, conn, path, stats, domain_mapping)
         except Exception as exc:
             stats.failed += 1
             stats.errors.append(f"{path.as_posix()}: {exc}")
@@ -258,10 +262,18 @@ def _remove_deleted(store, conn, seen_paths, stats: IngestStats, full_scan: bool
             stats.errors.append(f"{file_path}: {exc}")
 
 
-def _ingest_one(settings, embedding, store, conn, path, stats: IngestStats) -> None:
+def _ingest_one(
+    settings,
+    embedding,
+    store,
+    conn,
+    path,
+    stats: IngestStats,
+    domain_mapping: dict[str, DomainInfo],
+) -> None:
     """处理单个 Markdown 文件的完整入库流程。"""
     doc = parse_markdown(path, settings.vault_path_resolved)
-    document_id, changed, created = upsert_document(conn, doc)
+    document_id, changed, created = upsert_document(conn, doc, resolve_domain(doc.file_path, domain_mapping))
 
     if not changed:
         stats.unchanged += 1
@@ -317,6 +329,8 @@ def _build_vector_rows(conn, document_id: int) -> list[dict]:
                 "source": doc["source"],
                 "folder": doc["folder"],
                 "tags": doc["tags"],
+                "domain": doc["domain"],
+                "source_type": doc["source_type"],
             }
         )
     return rows
@@ -358,3 +372,72 @@ def report_truncated(embedding: BaseEmbedding, rows: list[dict]) -> int:
                 flush=True,
             )
     return count
+
+
+@dataclass
+class DomainRefreshStats:
+    """一次 refresh-domain 的结果，CLI 直接打印给用户核对。"""
+
+    documents_total: int = 0        # SQLite 文档总数（执行前后必须一致）
+    documents_updated: int = 0      # domain / source_type 实际变化了的文档数
+    vectors_total: int = 0          # Chroma 向量总数（执行前后必须一致）
+    vectors_updated: int = 0        # metadata 实际回填的向量数
+    domain_document_counts: dict = field(default_factory=dict)
+    domain_chunk_counts: dict = dict
+
+
+def refresh_domain_metadata(settings: Settings) -> DomainRefreshStats:
+    """只刷元数据：SQLite documents 两列 + Chroma metadata，不重算任何向量。
+
+    这条路径存在的理由：知识域映射表（YAML）是事后才有的，老文档的
+    content_hash 没变，正常 ingest 会把它们全部跳过，domain 永远补不上。
+    它和 rebuild_vectors 的分工：后者重算全部向量（换模型用），前者连一个
+    向量都不碰——所以整个过程不加载 embedding 模型，秒级完成。
+
+    不写 embedding 指纹：指纹描述的是"向量是用什么模型算的"，本路径
+    没有产生任何新向量，写指纹反而是在伪造信息。
+    """
+    mapping = load_domain_mapping(settings.knowledge_domains_path_resolved)
+    conn = connect(settings.db_path_resolved)
+    init_db(conn)  # 老库在这一步补齐 domain / source_type 两列
+    try:
+        docs = conn.execute("SELECT id, file_path, domain, source_type FROM documents").fetchall()
+        updated = 0
+        for doc in docs:
+            info = resolve_domain(doc["file_path"], mapping)
+            if doc["domain"] != info.domain or doc["source_type"] != info.source_type:
+                conn.execute(
+                    "UPDATE documents SET domain = ?, source_type = ? WHERE id = ?",
+                    (info.domain, info.source_type, doc["id"]),
+                )
+                updated += 1
+        conn.commit()
+
+        stats = DomainRefreshStats(documents_total=len(docs), documents_updated=updated)
+        stats.domain_document_counts = {
+            row["domain"]: row["n"]
+            for row in conn.execute(
+                "SELECT domain, COUNT(*) AS n FROM documents GROUP BY domain ORDER BY n DESC"
+            )
+        }
+        stats.domain_chunk_counts = {
+            row["domain"]: row["n"]
+            for row in conn.execute(
+                """
+                SELECT d.domain AS domain, COUNT(*) AS n
+                  FROM chunks c JOIN documents d ON d.id = c.document_id
+                 GROUP BY d.domain ORDER BY n DESC
+                """
+            )
+        }
+        chunk_rows = get_chunks_for_reindex(conn)
+    finally:
+        conn.close()
+
+    store = ChromaStore(settings.chroma_path_resolved)
+    try:
+        stats.vectors_total = store.count()
+        stats.vectors_updated = store.refresh_domain_metadata(chunk_rows)
+    finally:
+        store.close()
+    return stats

@@ -16,11 +16,16 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.vectorstore import ChromaStore
 
-# 后端允许吐出的全部事件名；出现这个集合之外的名字说明前后端协议漂移了
+# 后端允许吐出的全部事件名；出现这个集合之外的名字说明前后端协议漂移了。
+# routing_completed / evidence_completed / evidence_rescue_completed 是 Advisor 层
+# 的事件，仅在对应功能启用时出现。
 ALLOWED = {
+    "routing_completed",
     "retrieval_started",
     "retrieval_completed",
     "sources",
+    "evidence_completed",
+    "evidence_rescue_completed",
     "generation_started",
     "token",
     "done",
@@ -66,21 +71,27 @@ def test_stream_event_names_and_order(client):
     events = _stream(client)
     names = [e["event"] for e in events]
 
-    assert names[0] == "retrieval_started"
+    # Router 由 create_app 常驻注入，首事件是 routing_completed（global 决策）
+    assert names[0] == "routing_completed"
     assert names[-1] == "done"
     assert set(names) <= ALLOWED
     assert "error" not in names
 
-    # 阶段必须按 检索开始 → 检索完成 → 来源 → 开始生成 → 完成 推进
+    # 阶段必须按 路由 → 检索开始 → 检索完成 → 来源 → 开始生成 → 完成 推进
     pos = {n: names.index(n) for n in names}
     assert (
-        pos["retrieval_started"]
+        pos["routing_completed"]
+        < pos["retrieval_started"]
         < pos["retrieval_completed"]
         < pos["sources"]
         < pos["generation_started"]
         < pos["token"]
         < pos["done"]
     )
+    # 首事件里应带上规则路由的决策内容
+    route = events[0]["data"]["route"]
+    assert route["mode"] == "global"
+    assert route["origin"] == "rules"
 
 
 def test_stream_tokens_reassemble_done_answer(client):
@@ -131,7 +142,9 @@ def test_stream_empty_knowledge_base(settings):
         events = _stream(c)
 
     names = [e["event"] for e in events]
-    assert names == ["retrieval_started", "retrieval_completed", "sources", "done"]
+    assert names == [
+        "routing_completed", "retrieval_started", "retrieval_completed", "sources", "done",
+    ]
     assert "token" not in names
 
     done = _at(events, "done")["data"]
@@ -156,7 +169,7 @@ class _ExplodingLLM:
 class _ExplodingRetriever:
     """检索阶段就失败：验证 error 事件能出现在 generation_started 之前。"""
 
-    def search(self, question, top_k=None):
+    def search(self, question, top_k=None, domains=None):
         raise ValueError("检索库不可用")
 
 
@@ -183,7 +196,7 @@ def test_stream_error_during_retrieval(client):
     events = _stream(client)
 
     names = [e["event"] for e in events]
-    assert names == ["retrieval_started", "error"]
+    assert names == ["routing_completed", "retrieval_started", "error"]
     assert "done" not in names
     assert "检索库不可用" in _at(events, "error")["data"]["message"]
 

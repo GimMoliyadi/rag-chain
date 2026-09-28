@@ -1,0 +1,168 @@
+{
+  "_meta": {
+    "name": "personal_advisor_questions",
+    "purpose": "Personal Advisor 方向的检索评测候选题。全部 verified:false——未经过人工确认，不是 ground truth，得分只用于内部参考。",
+    "note_on_categories": "single_domain=应落在单个知识域；cross_domain=应同时检索多个知识域；domain_isolation=验证不该出现的域没有混进来（forbidden_domains）；personal_decision=军师层问题，靠知识库素材支撑个人决策；personal_context=依赖 Personal Context 的题（标记 requires_personal_context），没有用户当前情况时系统必须明确说缺少个人状态而不是编造；insufficient_evidence=知识库明确没有答案，检索层给不出'没有'信号（baseline 实测），期待后续由 LLM 层兜底。",
+    "note_on_personal_context": "personal_context 类题要跑两遍做 A/B：--personal-context 与 --no-personal-context。第二遍用于验证「清空个人状态后，同一题必须明确说缺少个人状态」。",
+    "created": "2026-09-23"
+  },
+  "questions": [
+    {
+      "id": 1,
+      "question": "为什么纳什均衡一定存在？",
+      "category": "single_domain",
+      "expected_domains": ["game_theory"],
+      "forbidden_domains": [],
+      "expected_documents": [],
+      "verified": false,
+      "notes": "用户指定必含题。博弈论核心定理，期望落在 game_theory。"
+    },
+    {
+      "id": 2,
+      "question": "囚徒困境为什么容易出现不合作结果？",
+      "category": "domain_isolation",
+      "expected_domains": ["game_theory"],
+      "forbidden_domains": ["han_li_framework"],
+      "verified": false,
+      "notes": "用户指定必含题。库里大量韩立模式笔记引用囚徒困境做类比，历史上曾混入 Top-5（baseline #13/#15/#21 同族问题），验证 scoped 检索后不再混入。"
+    },
+    {
+      "id": 3,
+      "question": "韩立处理风险和长期合作的思路，可以和博弈论中的哪些概念类比？",
+      "category": "cross_domain",
+      "expected_domains": ["han_li_framework", "game_theory"],
+      "forbidden_domains": [],
+      "verified": false,
+      "notes": "用户指定必含题。两个域都必须真正参与检索，不能只路由不执行。"
+    },
+    {
+      "id": 4,
+      "question": "韩立在实力弱小的时候靠什么原则在七玄门活了下来？",
+      "category": "domain_isolation",
+      "expected_domains": ["han_li_framework"],
+      "forbidden_domains": ["game_theory"],
+      "verified": false,
+      "notes": "反向隔离：韩立问题不应被博弈论笔记淹没。"
+    },
+    {
+      "id": 5,
+      "question": "凸轮机构从动件常用的运动规律有哪些？",
+      "category": "single_domain",
+      "expected_domains": ["mechanical_design"],
+      "forbidden_domains": [],
+      "verified": false,
+      "notes": "机械设计基础-04-凸轮机构.md 真实存在。"
+    },
+    {
+      "id": 6,
+      "question": "一维谐振子的能级有什么特点？",
+      "category": "single_domain",
+      "expected_domains": ["quantum_mechanics"],
+      "forbidden_domains": [],
+      "verified": false,
+      "notes": "quantum-mechanics/05_one_dimensional_systems/ 下有谐振子内容（baseline 第9题曾命中 harmonic-oscillator.md）。"
+    },
+    {
+      "id": 7,
+      "question": "复合配料在配料表里应该怎么标示？",
+      "category": "single_domain",
+      "expected_domains": ["food_label"],
+      "forbidden_domains": [],
+      "verified": false,
+      "notes": "GB7718-2025/03-配料表规则.md 真实存在（baseline #22 的期望文档）。"
+    },
+    {
+      "id": 8,
+      "question": "《当下的力量》里说的心理时间是什么意思？",
+      "category": "single_domain",
+      "expected_domains": ["philosophy"],
+      "forbidden_domains": [],
+      "verified": false,
+      "notes": "当下的力量/心理时间.md 真实存在。"
+    },
+    {
+      "id": 9,
+      "question": "精益创业里的最小可行产品（MVP）起什么作用？",
+      "category": "single_domain",
+      "expected_domains": ["lean_startup"],
+      "forbidden_domains": [],
+      "verified": false,
+      "notes": "01-精益创业2.0/concepts 真实存在。"
+    },
+    {
+      "id": 10,
+      "question": "韩立模式里的长期合作原则和博弈论的重复博弈有什么相通之处？",
+      "category": "cross_domain",
+      "expected_domains": ["han_li_framework", "game_theory"],
+      "forbidden_domains": [],
+      "verified": false,
+      "notes": "跨域第二题，换措辞验证路由稳定性。"
+    },
+    {
+      "id": 11,
+      "question": "该不该接受一份短期吃亏但可能换来长期信任的合作？",
+      "category": "personal_decision",
+      "expected_domains": [],
+      "forbidden_domains": [],
+      "verified": false,
+      "notes": "军师层问题：答案要用 han_li_framework + game_theory 的素材支撑个人决策。本阶段只登记，判分方式等军师层设计定。"
+    },
+    {
+      "id": 12,
+      "question": "面对一个回报不确定的新机会，应该押注还是保守？",
+      "category": "personal_decision",
+      "expected_domains": [],
+      "forbidden_domains": [],
+      "verified": false,
+      "notes": "军师层问题，同上。"
+    },
+    {
+      "id": 13,
+      "question": "pandas 按地区分组求和的代码应该怎么写？",
+      "category": "insufficient_evidence",
+      "expected_domains": [],
+      "forbidden_domains": [],
+      "verified": false,
+      "notes": "复用 baseline #31：知识库明确没有答案，检索器仍会返回不相关结果（实测 0.5204 命中 Hotelling模型），验证 LLM 层的'知识不足'兜底。"
+    },
+    {
+      "id": 14,
+      "question": "给家里的狗选狗粮应该怎么按成分挑选？",
+      "category": "insufficient_evidence",
+      "expected_domains": [],
+      "forbidden_domains": [],
+      "verified": false,
+      "notes": "复用 baseline #30：知识库没有宠物喂养内容（中医食养的'狗'是人药膳，baseline #32 已证混入）。"
+    },
+    {
+      "id": 15,
+      "question": "我现在有几个项目同时推进，应该先收尾哪个？",
+      "category": "personal_context",
+      "expected_domains": [],
+      "forbidden_domains": [],
+      "requires_personal_context": true,
+      "verified": false,
+      "notes": "答案必须引用 Personal Context 里 projects / goals 的状态（哪个进行到哪一步、卡在哪里）。清空 PC 后再问同一题，系统必须说缺少个人状态。"
+    },
+    {
+      "id": 16,
+      "question": "我目前主要方向是什么？",
+      "category": "personal_context",
+      "expected_domains": [],
+      "forbidden_domains": [],
+      "requires_personal_context": true,
+      "verified": false,
+      "notes": "答案直接来自 PC 的 profile.current_direction，知识库检索不该参与。PC 没填这一项时不能答。"
+    },
+    {
+      "id": 17,
+      "question": "结合我的职业方向，RAG 和 Godot 游戏开发哪个更值得近期投入？",
+      "category": "personal_context",
+      "expected_domains": [],
+      "forbidden_domains": [],
+      "requires_personal_context": true,
+      "verified": false,
+      "notes": "PC 决定取舍的起点（当前方向、时间约束），知识库可以提供 RAG 相关素材；期望给出多个可选行动而不是唯一答案。"
+    }
+  ]
+}

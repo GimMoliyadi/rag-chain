@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .chunker import Chunk
+from .knowledge_domains import DomainInfo
 from .parser import ParsedDocument
 
 SCHEMA = """
@@ -32,6 +33,8 @@ CREATE TABLE IF NOT EXISTS documents (
     source       TEXT    NOT NULL DEFAULT '',
     content      TEXT    NOT NULL,
     content_hash TEXT    NOT NULL,                 -- 正文 sha256，判断内容有没有变
+    domain       TEXT    NOT NULL DEFAULT '',      -- 知识域，由顶层目录映射而来（'' = 还没刷过）
+    source_type  TEXT    NOT NULL DEFAULT '',      -- 来源类型，只是描述，不代表可信度
     created_at   TEXT    NOT NULL DEFAULT '',
     updated_at   TEXT    NOT NULL DEFAULT ''
 );
@@ -70,9 +73,22 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """建表。重复调用安全（IF NOT EXISTS）。"""
+    """建表。重复调用安全（IF NOT EXISTS），并给老库补齐新增列。"""
     conn.executescript(SCHEMA)
+    _ensure_columns(conn)
     conn.commit()
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """老库升级：CREATE TABLE IF NOT EXISTS 对已存在的表不做任何事，缺的列要靠 ALTER 补。
+
+    目前只有 knowledge_domains 阶段二加的两列。'' 表示"还没刷过"，
+    刷新路径（refresh_domain_metadata）会把全库刷成具体值或 unknown。
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
+    for column in ("domain", "source_type"):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE documents ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
 
 
 def content_hash(content: str) -> str:
@@ -80,30 +96,41 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def upsert_document(conn: sqlite3.Connection, doc: ParsedDocument) -> tuple[int, bool, bool]:
+def upsert_document(
+    conn: sqlite3.Connection,
+    doc: ParsedDocument,
+    domain_info: DomainInfo | None = None,
+) -> tuple[int, bool, bool]:
     """写入或更新文档，返回 (document_id, changed, created)。
 
     changed=False 表示内容哈希没变、库里已经有这份内容，调用方可以跳过切块和向量化——
     这就是增量 ingest 的核心：重复跑不会重复插库。
     created=True 表示这是第一次入库（新文档），否则是内容变化后的更新。
+
+    domain_info 传了就把知识域一并写入；不传（旧调用方）保持该列原值不动。
+    注意 changed=False 的早退分支发生在写入之前，所以"内容没变的老文档"
+    靠这里的写入拿不到 domain——它们由 refresh_domain_metadata 统一回填。
     """
     digest = content_hash(doc.content)
-    row = conn.execute("SELECT id, content_hash FROM documents WHERE file_path = ?", (doc.file_path,)).fetchone()
+    row = conn.execute("SELECT id, content_hash, domain, source_type FROM documents WHERE file_path = ?", (doc.file_path,)).fetchone()
 
     if row and row["content_hash"] == digest:
         return row["id"], False, False
 
     tags_csv = ",".join(doc.tags)
+    domain = domain_info.domain if domain_info else ""
+    source_type = domain_info.source_type if domain_info else ""
     if row:
         conn.execute(
             """
             UPDATE documents
                SET title = ?, folder = ?, tags = ?, source = ?, content = ?,
-                   content_hash = ?, created_at = ?, updated_at = ?
+                   content_hash = ?, created_at = ?, updated_at = ?,
+                   domain = ?, source_type = ?
              WHERE id = ?
             """,
             (doc.title, doc.folder, tags_csv, doc.source, doc.content,
-             digest, doc.created_at, doc.updated_at, row["id"]),
+             digest, doc.created_at, doc.updated_at, domain, source_type, row["id"]),
         )
         conn.commit()
         return row["id"], True, False
@@ -111,11 +138,12 @@ def upsert_document(conn: sqlite3.Connection, doc: ParsedDocument) -> tuple[int,
     cur = conn.execute(
         """
         INSERT INTO documents
-            (title, file_path, folder, tags, source, content, content_hash, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (title, file_path, folder, tags, source, content, content_hash,
+             created_at, updated_at, domain, source_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (doc.title, doc.file_path, doc.folder, tags_csv, doc.source, doc.content,
-         digest, doc.created_at, doc.updated_at),
+         digest, doc.created_at, doc.updated_at, domain, source_type),
     )
     conn.commit()
     return cur.lastrowid, True, True
@@ -217,7 +245,8 @@ def get_chunks_for_reindex(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """
         SELECT c.id AS chunk_id, c.document_id, c.chunk_index, c.content, c.heading,
-               d.title, d.file_path, d.source, d.folder, d.tags
+               d.title, d.file_path, d.source, d.folder, d.tags,
+               d.domain, d.source_type
           FROM chunks c
           JOIN documents d ON d.id = c.document_id
          ORDER BY d.id, c.chunk_index

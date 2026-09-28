@@ -5,6 +5,7 @@
     python ingest.py --path 01-精益创业2.0   # 只导入某个子目录
     python ingest.py --limit 20             # 只导入前 20 篇，快速试跑
     python ingest.py --rebuild-vectors      # 只重建 Chroma 向量（换 embedding 模型后用）
+    python ingest.py --refresh-domain       # 只刷知识域元数据（改 YAML 后用，不重算向量）
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ import time
 
 from app.config import Settings
 from app.embedding import get_embedding_client
-from app.ingest import rebuild_vectors, run_ingest
+from app.ingest import rebuild_vectors, refresh_domain_metadata, run_ingest
 from app.vectorstore import ChromaStore
 
 
@@ -26,10 +27,38 @@ def main() -> None:
         action="store_true",
         help="只用 SQLite 里的 chunk 重建 Chroma 向量，不重新解析 Vault",
     )
+    parser.add_argument(
+        "--refresh-domain",
+        action="store_true",
+        help="按 config/knowledge_domains.yaml 刷新 domain 元数据（SQLite + Chroma），不重算向量",
+    )
     args = parser.parse_args()
 
     settings = Settings()
     settings.validate_providers()
+
+    # 刷新元数据不加载 embedding 模型：它一个向量都不算，加载 2 GB 模型纯属浪费。
+    # 必须放在 get_embedding_client 之前短路，否则"不重算 embedding"只是嘴上说说。
+    if args.refresh_domain:
+        if args.path or args.limit or args.rebuild_vectors:
+            raise SystemExit("--refresh-domain 不能和 --path / --limit / --rebuild-vectors 同用")
+        if not settings.db_path_resolved.is_file():
+            raise SystemExit(f"数据库不存在：{settings.db_path_resolved}，先跑一次 python ingest.py")
+        print(f"数据库      : {settings.db_path_resolved}")
+        print(f"向量库      : {settings.chroma_path_resolved}")
+        print(f"映射表      : {settings.knowledge_domains_path_resolved}")
+        print("模式        : 只刷知识域元数据（不加载 embedding 模型，不重算向量）")
+        print("-" * 60)
+        stats = refresh_domain_metadata(settings)
+        print(f"documents   : {stats.documents_total} 篇（更新 {stats.documents_updated}）")
+        print(f"vectors     : {stats.vectors_total} 条（回填 metadata {stats.vectors_updated} 条）")
+        print("各 domain 文档数:")
+        for domain, n in stats.domain_document_counts.items():
+            print(f"  {domain:<24} {n}")
+        print("各 domain chunk 数:")
+        for domain, n in stats.domain_chunk_counts.items():
+            print(f"  {domain:<24} {n}")
+        return
 
     # vault 在下面无条件打印，所以提前取出来。
     # 存在性校验只对完整入库有意义：重建向量索引不需要读 Vault。

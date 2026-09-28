@@ -58,6 +58,55 @@ class Settings(BaseSettings):
     chunk_overlap: int = 120    # 相邻 chunk 的重叠字符数
     top_k: int = 5              # 检索默认返回条数
 
+    # ---- Knowledge Domain（Personal Advisor）----
+    # Vault 顶层目录 -> (domain, source_type) 的映射表和 Router 术语表都在这一个文件里，
+    # 改归类/加领域只动 YAML，不动代码。未映射目录在入库时统一记为 unknown。
+    knowledge_domains_config: str = "config/knowledge_domains.yaml"
+
+    # ---- Document Diversity（同文档 chunk 限额，实验性）----
+    # 默认关闭：评估口径优先，开关一开一关必须复现同一个数字。
+    # 开启后流程变成：先取 DIVERSITY_CANDIDATE_K 条候选 -> 按 document_id 限额
+    # （每篇文档最多 max_chunks_per_document 条）-> 组成最终 Top-K。
+    # 解决的实测问题：长章节的多个 chunk 吃满 Top-5（baseline #22）。
+    diversity_enabled: bool = False
+    max_chunks_per_document: int = 2
+
+    # ---- Evidence Gate（证据充分性门控，Personal Advisor）----
+    # 默认关闭：关闭时 /api/chat 的行为与历史版本完全一致，方便 Judge 前/后 A/B。
+    # 开启后检索结果先交给 LLM Judge 评审「资料够不够回答」，再决定正常回答 /
+    # 带保留回答 / 直接拒答。判定靠 LLM 读资料，不靠 cosine 分数阈值——
+    # 实测有答案与无答案查询的分数区间高度重叠，固定阈值必然大面积误判。
+    evidence_gate_enabled: bool = False
+    # 单条 chunk 进入 Judge Prompt 前的最大字符数。Judge 只需要判断
+    # 「有没有相关证据」，不需要逐字核对全文，截断能把 Judge 请求压小、变快。
+    evidence_judge_chunk_chars: int = 600
+
+    # ---- LLM Router fallback（规则零命中时才启用）----
+    # 默认关闭：关闭时规则 Router 零命中就直接 global，不调 LLM。
+    # 开启后仅当规则 Router 零命中（mode=global）时，才让 LLM 从 YAML 里
+    # 真实存在的 domain 清单中选域；LLM 也拿不准时返回 global——宁可全库检索，
+    # 不可按错误的路由把真答案挡在候选池外。
+    llm_router_fallback_enabled: bool = False
+
+    # ---- Evidence Rescue（证据救援，Personal Advisor）----
+    # 只在 Evidence Gate 第一次判定 insufficient 时触发一次，sufficient / partial
+    # 完全不多花一步。动机是实测发现的一类 FN：答案在库里，但被压在 Top-5 之外
+    # （凸轮运动规律题的答案 chunk 真实排名 #7，Top-5 只取到 chunk0/1 + 别的文档），
+    # Judge 对「它拿到的那 5 条」判不足是对的，错的只是候选池太小。
+    # 救援 = 扩大候选池再评审一次，不做重排、不做问题改写。
+    # 救援池不加「每文档最多 N chunk」的限额：实测同一份 diversity 配置下，
+    # 凸轮那道题的答案（同文档第 3 个 chunk）会被限额直接挤掉，救援失效。
+    evidence_rescue_enabled: bool = False
+    evidence_rescue_k: int = 20
+
+    # ---- Personal Context（用户当前状态，V1 只读、由用户自己维护）----
+    # 默认关闭：关闭时 Router / 检索 / Evidence Gate / RAG 全部不变，
+    # /api/chat 的 mode=normal 行为与历史版本逐字节一致。
+    # 这个文件是「用户现在在做什么」，不是知识库——不入库、不进 Chroma、
+    # 不算 embedding、不做向量检索：体量小、每次 advisor 提问全量读取。
+    personal_context_enabled: bool = False
+    personal_context_path: str = "personal_context/context.yaml"
+
     # ---- Context 清洗（retrieval 和 LLM 之间的一层）----
     # 默认关闭：评估阶段要随时拿回"原始检索结果"的数字当 baseline，
     # 开关一开一关必须能复现同一个数字。
@@ -138,6 +187,14 @@ class Settings(BaseSettings):
     @property
     def chroma_path_resolved(self) -> Path:
         return _resolve_path(self.chroma_path)
+
+    @property
+    def knowledge_domains_path_resolved(self) -> Path:
+        return _resolve_path(self.knowledge_domains_config)
+
+    @property
+    def personal_context_path_resolved(self) -> Path:
+        return _resolve_path(self.personal_context_path)
 
     @property
     def vault_path_resolved(self) -> Path:
@@ -221,6 +278,23 @@ class Settings(BaseSettings):
             )
         if self.embedding_batch_size < 1:
             raise ValueError(f"EMBEDDING_BATCH_SIZE 必须是正整数，当前：{self.embedding_batch_size}")
+        # 多样性限额只在显式开启时校验，理由和精排一样：关着的时候填错不该挡启动。
+        if self.diversity_enabled and self.max_chunks_per_document < 1:
+            raise ValueError(
+                f"MAX_CHUNKS_PER_DOCUMENT 必须是正整数，当前：{self.max_chunks_per_document}"
+            )
+        # 救援只在「第一次评审不足」之后跑第二次评审，所以它依赖 Evidence Gate。
+        # 让配置在启动时报错而不是运行时静默不生效——静默无效的配置比报错更危险。
+        if self.evidence_rescue_enabled:
+            if not self.evidence_gate_enabled:
+                raise ValueError(
+                    "EVIDENCE_RESCUE_ENABLED=true 需要先开启 EVIDENCE_GATE_ENABLED："
+                    "救援是在第一次评审判定 insufficient 之后才跑的流程。"
+                )
+            if self.evidence_rescue_k < 1:
+                raise ValueError(
+                    f"EVIDENCE_RESCUE_K 必须是正整数，当前：{self.evidence_rescue_k}"
+                )
         # 精排只在显式开启时才有意义，所以校验也只在开启时触发；
         # 关着的时候填了错的设备名不该让服务起不来。
         if self.reranker_enabled:

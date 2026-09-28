@@ -1,0 +1,185 @@
+# ============================================================
+# 知识域映射表（Personal Advisor 阶段一）
+#
+# 作用：把 Vault 顶层目录映射到检索域（domain）和来源类型（source_type）。
+# - 匹配规则：按文档 file_path 的第一段（顶层目录名）精确匹配；
+#   根目录散落的文件（没有顶层目录）和未列出的目录，入库时记为 unknown。
+# - 一个 domain 可以对应多个目录（如 food_label 由两个目录组成）。
+# - source_type 只是元数据，不代表可信度；可信度判断属于后续军师层。
+# - 目录名来自 2026-09-23 对真实 Vault 的扫描，不是猜出来的。
+# ============================================================
+
+knowledge_domains:
+  # ---------- 博弈论 ----------
+  博弈论-AI知识库:
+    domain: game_theory
+    source_type: academic
+  博弈论书籍:
+    domain: game_theory
+    source_type: book        # 目前全是 PDF/djvu，parser 只收 .md，暂时不会有 chunk 入这个域
+
+  # ---------- 韩立模式 / 凡人修仙传 ----------
+  韩立模式:
+    domain: han_li_framework
+    source_type: derived_framework
+  《凡人修仙传》-分卷:
+    domain: fiction
+    source_type: fiction     # 目前全是 .txt，parser 不索引；要进检索需先转成 .md（待定）
+
+  # ---------- 食品标签 ----------
+  食品标签知识库:
+    domain: food_label
+    source_type: reference   # GB2760 / GB7718 / GB28050 / GB14880 等标准拆解都在这个目录下
+  食品标签指南:
+    domain: food_label
+    source_type: personal    # 用户自写指南；原计划的 user_notes 不在阶段六枚举里，归 personal
+
+  # ---------- 课程类 ----------
+  机械设计基础:
+    domain: mechanical_design
+    source_type: course
+  化工原理:
+    domain: chemical_engineering
+    source_type: course
+  安全管理学:
+    domain: safety_management
+    source_type: course
+  quantum-mechanics:
+    domain: quantum_mechanics
+    source_type: course
+
+  # ---------- 书籍 / 哲学 ----------
+  当下的力量:
+    domain: philosophy
+    source_type: book
+  幸福之路:
+    domain: philosophy
+    source_type: book
+  高质量书籍:
+    domain: philosophy
+    source_type: book        # 两篇拆书笔记，内容偏心灵成长，暂归 philosophy，不合适就改这两行
+  01-精益创业2.0:
+    domain: lean_startup
+    source_type: book
+
+  # ---------- 中医 ----------
+  中医食养百科:
+    domain: tcm_dietetics
+    source_type: book        # 本草纲目 / 药膳大辞典 / 随息居等书源 OCR
+
+  # ---------- 个人 ----------
+  理财知识库:
+    domain: personal_finance
+    source_type: personal    # 目前是空目录；留映射，未来内容会直接落对域
+
+# ============================================================
+# Query Router 术语表（阶段九）
+#
+# 规则：问题文本里命中了哪个域的术语（大小写不敏感的子串匹配），
+# 就路由到那个域；命中多个域 = multi_domain；一个都没命中 = global。
+#
+# 选词纪律是"宁漏勿误"：只收足够特异的术语和实体。
+# 「合作」「风险」「学习」这类跨域高频词严禁入表——它们会把
+# 八竿子打不着的问题误过滤成单域检索，把真答案挡在候选池外。
+# ============================================================
+router_terms:
+  game_theory:
+    - 纳什均衡
+    - 囚徒困境
+    - 博弈论
+    - 博弈
+    - 占优策略
+    - 混合策略
+    - 重复博弈
+    - 零和
+    - 帕累托
+    - 子博弈
+    - 贝叶斯均衡
+    - 讨价还价
+    - 演化稳定
+  han_li_framework:
+    - 韩立
+    - 韩老魔
+    - 掌天瓶
+    - 韩立模式
+  fiction:
+    - 凡人修仙传
+    - 忘语
+  quantum_mechanics:
+    - 量子
+    - 波函数
+    - 薛定谔
+    - 本征态
+    - 本征值
+    - 算符
+    - 自旋
+    - 隧穿
+    - 叠加态
+    - 势阱
+    - 谐振子
+    - 哈密顿
+  food_label:
+    - 配料表
+    - 营养标签
+    - 营养成分表
+    - 食品添加剂
+    - 保质期
+    - 标示
+    - GB7718
+    - GB28050
+    - GB2760
+    - GB14880
+  mechanical_design:
+    - 齿轮
+    - 凸轮
+    - 轴承
+    - 连杆
+    - 自由度
+    - 减速器
+    - 轮系
+    - 机械设计
+    - 螺纹连接
+    - 轴系
+  chemical_engineering:
+    - 化工原理
+    - 流体
+    - 传热
+    - 精馏
+    - 蒸馏
+    - 离心泵
+    - 换热
+    - 蒸发器
+  philosophy:
+    - 临在
+    - 心理时间
+    - 思维认同
+    - 当下的力量
+    - 幸福之路
+    - 次生痛苦
+  tcm_dietetics:
+    - 食养
+    - 药膳
+    - 本草纲目
+    - 性味
+    - 归经
+    - 食疗
+    - 饮膳正要
+    - 随息居
+  lean_startup:
+    - 精益创业
+    - 最小可行产品
+    - MVP
+    - 验证性学习
+  safety_management:
+    - 安全管理学
+    - 事故致因
+    - 海因里希
+    - 危险源
+    - 安全生产
+  personal_finance:
+    - 理财
+    - 基金
+    - 股票
+    - 资产配置
+    - 复利
+

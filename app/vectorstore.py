@@ -95,16 +95,20 @@ class ChromaStore:
             metadatas=[_metadata(r) for r in rows],
         )
 
-    def query(self, embedding: list[float], n_results: int = 5) -> list[dict]:
+    def query(self, embedding: list[float], n_results: int = 5, where: dict | None = None) -> list[dict]:
         """按向量找最近的 n_results 条，返回 [{content, distance, **metadata}]。
 
+        where 是 Chroma 的 metadata 过滤条件（scoped retrieval 用它限定 domain），
+        None / 空值表示不过滤——全库检索的路径必须保持和以前逐字节一致。
         Chroma 原生的返回是 result["ids"][0] / result["metadatas"][0] 这种嵌套结构，
         在这里摊平成列表，上层就不用知道 Chroma 的返回格式了。
         """
+        query_kwargs = {"where": where} if where else {}
         result = self._col.query(
             query_embeddings=[embedding],
             n_results=n_results,
             include=["documents", "metadatas", "distances"],
+            **query_kwargs,
         )
         ids = result["ids"][0]
         docs = result["documents"][0]
@@ -125,6 +129,46 @@ class ChromaStore:
             return
         self._col.delete(where={"document_id": document_id})
 
+    def refresh_domain_metadata(self, rows: list[dict]) -> int:
+        """把 SQLite 行算出的期望 metadata 回填到 Chroma，只改 metadata。
+
+        为什么不用重建：现有向量的数值本身没有错，错的只是 metadata 缺 domain 字段。
+        col.update 只写 metadata，不重算 embedding、不删任何向量——这是对
+        "改映射表就能让全库生效"这个需求的最低代价路径。重建（rebuild_vectors）
+        要把 14303 个 chunk 全部重新过一遍 BGE-M3，那是给换模型用的，杀鸡用牛刀。
+
+        rows 是 get_chunks_for_reindex 的输出（SQLite 是唯一事实来源）；
+        期望值按 _metadata 计算，和 ingest 写入的格式逐字段一致。
+        只更新和当前值不同的条目，返回更新的条数。
+        SQLite 有、Chroma 没有的 chunk 在这里跳过——补齐它属于 ingest/重建的职责，
+        元数据回填不顺便造向量。
+        """
+        got = self._col.get(include=["metadatas"])
+        current = dict(zip(got["ids"], got["metadatas"]))
+        changed_ids: list[str] = []
+        changed_metas: list[dict] = []
+        for row in rows:
+            chunk_id = str(row["chunk_id"])
+            existing = current.get(chunk_id)
+            if existing is None:
+                continue
+            desired = _metadata(row)
+            if {key: existing.get(key) for key in desired} != desired:
+                changed_ids.append(chunk_id)
+                changed_metas.append(desired)
+
+        for start in range(0, len(changed_ids), METADATA_UPDATE_BATCH):
+            self._col.update(
+                ids=changed_ids[start : start + METADATA_UPDATE_BATCH],
+                metadatas=changed_metas[start : start + METADATA_UPDATE_BATCH],
+            )
+        return len(changed_ids)
+
+
+# metadata 回填时一次 col.update 带多少条。Chroma 单次调用负载和批大小成正比，
+# 500 条 metadata（不含向量）约几百 KB，分批只影响内存峰值不影响结果。
+METADATA_UPDATE_BATCH = 500
+
 
 def _metadata(row: dict) -> dict:
     """把一行 chunk 记录转成 ChromaDB 能接受的标量 metadata。"""
@@ -138,4 +182,6 @@ def _metadata(row: dict) -> dict:
         "source": str(row.get("source", "")),
         "folder": str(row.get("folder", "")),
         "tags": ",".join(row["tags"]) if isinstance(row.get("tags"), list) else str(row.get("tags", "")),
+        "domain": str(row.get("domain", "")),
+        "source_type": str(row.get("source_type", "")),
     }
