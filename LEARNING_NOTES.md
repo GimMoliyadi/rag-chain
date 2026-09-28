@@ -400,8 +400,10 @@ return {
 
 ### 完整链路一张图
 
+入口有三个，都由 `app/engine.py` 装配出同一个 `RAGEngine`。下面这条画的是从 HTTP 走的路径：
+
 ```
-浏览器 /docs 点 Try it out
+浏览器打开 /docs 点 Try it out      ← Swagger 自动生成的接口调试页，不是聊天界面
   │  HTTP POST /api/chat  {"question": "什么是 POVM？"}
   ▼
 app/main.py      chat()                          ← 路由 + pydantic 校验
@@ -425,10 +427,11 @@ app/rag.py       RAGEngine.answer()              ← 编排整个流程
           └─ OpenAICompatibleLLM（真模型）或 MockLLM（回显 prompt）
   │
   ▼
-app/main.py      转成 {"answer", "used_chunks", "sources"}  ← JSON 返回
+{"answer", "used_chunks", "sources"}              ← RAGEngine 的返回值
   │
-  ▼
-浏览器渲染答案 + 引用列表
+  ├─► ask.py         打印到终端：答案 + 引用列表
+  ├─► mcp_server.py  交给 Claude Code，在对话里带引用回答
+  └─► app/main.py    包成 JSON，HTTP 客户端自己解析
 ```
 
 ### SQLite 在哪里？（单独说明）
