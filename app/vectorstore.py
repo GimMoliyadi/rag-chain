@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 import chromadb
+from langchain_chroma import Chroma
 
 COLLECTION_NAME = "obsidian_chunks"
 
@@ -36,6 +37,13 @@ class ChromaStore:
         self._col = self._client.get_or_create_collection(
             name=collection_name,
             metadata={"hnsw:space": "cosine"},
+        )
+        # LangChain 官方 Chroma 适配器与原生写入层共用同一个 client / collection。
+        # 不重建向量、不改旧 ID；检索由 LangChain 接管，写入与元数据维护沿用已有可靠流程。
+        self._lc_store = Chroma(
+            client=self._client,
+            collection_name=collection_name,
+            create_collection_if_not_exists=False,
         )
         # 指纹放 chroma 目录的同级（data/embedding_index.json）
         self._info_path = persist_dir.parent / INDEX_INFO_FILENAME
@@ -62,6 +70,13 @@ class ChromaStore:
         self._col = self._client.get_or_create_collection(
             name=self._col.name,
             metadata={"hnsw:space": "cosine"},
+        )
+        # clear() 后旧的 LangChain wrapper 会指向已经删除的 collection，
+        # 因此需要重新绑定。SQLite 原文及索引指纹由现有调用方独立管理。
+        self._lc_store = Chroma(
+            client=self._client,
+            collection_name=self._col.name,
+            create_collection_if_not_exists=False,
         )
 
     def close(self) -> None:
@@ -96,27 +111,21 @@ class ChromaStore:
         )
 
     def query(self, embedding: list[float], n_results: int = 5, where: dict | None = None) -> list[dict]:
-        """按向量找最近的 n_results 条，返回 [{content, distance, **metadata}]。
+        """经由 LangChain Chroma 适配器检索，保留原有结果格式和余弦距离口径。
 
-        where 是 Chroma 的 metadata 过滤条件（scoped retrieval 用它限定 domain），
-        None / 空值表示不过滤——全库检索的路径必须保持和以前逐字节一致。
-        Chroma 原生的返回是 result["ids"][0] / result["metadatas"][0] 这种嵌套结构，
-        在这里摊平成列表，上层就不用知道 Chroma 的返回格式了。
+        where 用于知识域 metadata 筛选；不改变库里的 embedding/ID/metadata。
         """
-        query_kwargs = {"where": where} if where else {}
-        result = self._col.query(
-            query_embeddings=[embedding],
-            n_results=n_results,
-            include=["documents", "metadatas", "distances"],
-            **query_kwargs,
+        # LangChain 的 by_vector_with_relevance_scores 虽然名字含 relevance，
+        # 但返回的分数实际是 Chroma 原始距离（越小越相近），与旧版距离一致。
+        # 保留原始距离以兼容 SearchResult.score = 1 - cosine_distance 的评测口径。
+        results = self._lc_store.similarity_search_by_vector_with_relevance_scores(
+            embedding=embedding,
+            k=n_results,
+            filter=where,
         )
-        ids = result["ids"][0]
-        docs = result["documents"][0]
-        metas = result["metadatas"][0]
-        distances = result["distances"][0]
         return [
-            {"content": docs[i], "distance": distances[i], **(metas[i] or {})}
-            for i in range(len(ids))
+            {"content": document.page_content, "distance": distance, **document.metadata}
+            for document, distance in results
         ]
 
     def delete_by_document(self, document_id: int) -> None:
