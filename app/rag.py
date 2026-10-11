@@ -18,6 +18,8 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
+from langchain_core.prompts import ChatPromptTemplate
+
 from .context_filter import prepare_context
 from .evidence import (
     STATUS_INSUFFICIENT,
@@ -652,22 +654,31 @@ class RAGEngine:
         return hits, contents
 
 
+def _render_chat_prompt(system_template: str, user_template: str, **variables: str) -> list[dict]:
+    """由 LangChain ChatPromptTemplate 生成现有 LLM 客户端使用的角色消息格式。
+
+    保留 OpenAI / Anthropic / Mock 三种 provider 的旧接口及 system/user 文本，
+    因此流式和非流式请求的提示词内容不会分叉。
+    """
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_template),
+        ("human", user_template),
+    ])
+    return [
+        {"role": "system" if message.type == "system" else "user", "content": message.content}
+        for message in prompt.format_messages(**variables)
+    ]
+
+
 def _build_messages(
     question: str, context: str, vault_name: str, partial: bool = False,
 ) -> list[dict]:
-    """拼发给 LLM 的 messages。answer() 和 answer_stream() 共用这一份，
-    否则两条链路各自的 Prompt 写法早晚会有出入。
-
-    partial=True 表示证据评审判定资料只覆盖了问题的部分方面，
-    system prompt 追加「区分支持部分和缺依据部分」的硬性要求。
-    """
-    system = SYSTEM_PROMPT.format(vault_name=vault_name)
-    if partial:
-        system += PARTIAL_EVIDENCE_ADDENDUM
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": USER_PROMPT_TEMPLATE.format(context=context, question=question)},
-    ]
+    """LangChain 负责模板格式化；内容、引用编号和证据约束沿用已验证的规则。"""
+    system_template = SYSTEM_PROMPT + (PARTIAL_EVIDENCE_ADDENDUM if partial else "")
+    return _render_chat_prompt(
+        system_template, USER_PROMPT_TEMPLATE,
+        vault_name=vault_name, context=context, question=question,
+    )
 
 
 def _build_advisor_messages(
@@ -677,20 +688,15 @@ def _build_advisor_messages(
     personal_context: str,
     partial: bool = False,
 ) -> list[dict]:
-    """advisor 模式的 messages：三段式 Prompt + 强制区分三类信息来源。
-
-    与 _build_messages 分开写，两者共用同一个 _build_context 拼编号资料，
-    这样 [1][2] 和 sources 数组的对应关系不会因模式不同而出偏差。
-    """
-    system = SYSTEM_PROMPT_ADVISOR.format(vault_name=vault_name)
-    if partial:
-        system += ADVISOR_PARTIAL_EVIDENCE_ADDENDUM
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": ADVISOR_USER_PROMPT_TEMPLATE.format(
-            personal_context=personal_context, context=context, question=question,
-        )},
-    ]
+    """保留 advisor 三种信息来源的分离约束，使用同一 LangChain 模板机制。"""
+    system_template = SYSTEM_PROMPT_ADVISOR + (
+        ADVISOR_PARTIAL_EVIDENCE_ADDENDUM if partial else ""
+    )
+    return _render_chat_prompt(
+        system_template, ADVISOR_USER_PROMPT_TEMPLATE,
+        vault_name=vault_name, context=context, question=question,
+        personal_context=personal_context,
+    )
 
 
 def _normalize_mode(mode: str) -> str:

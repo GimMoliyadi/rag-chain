@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .embedding import BaseEmbedding
+from .langchain_adapters import LangChainEmbeddingsAdapter
 from .vectorstore import ChromaStore
 
 
@@ -53,6 +54,7 @@ class Retriever:
         max_chunks_per_document: int = 2,
     ):
         self._embedding = embedding
+        self._lc_embedding = LangChainEmbeddingsAdapter(embedding)
         self._store = store
         self._default_top_k = default_top_k
         self._diversity_enabled = diversity_enabled
@@ -83,7 +85,7 @@ class Retriever:
         scoped = bool(domains)
         where = {"domain": {"$in": list(domains)}} if scoped else None
         candidate_k = DIVERSITY_CANDIDATE_K if self._diversity_enabled else k
-        question_vector = self._embedding.embed_query(question)
+        question_vector = self._lc_embedding.embed_query(question)
         rows = self._store.query(question_vector, n_results=min(candidate_k, count), where=where)
 
         fallback = False

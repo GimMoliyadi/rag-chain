@@ -5,6 +5,12 @@
 # 需要 bit-for-bit 复现时按这份装；否则下面的下限允许安全升级。
 # 唯一 pin 死的是 sentence-transformers，原因见它上面那段注释。
 
+# LangChain 1.x RAG 核心：标准 Embeddings / Prompt / Chroma VectorStore 接口
+# 保留现有 SQLite 与引用定位，避免迁移时破坏已验证的数据格式。
+langchain>=1.0,<2.0
+langchain-core>=1.0,<2.0
+langchain-chroma>=1.0,<2.0
+
 # Web 框架与服务器
 fastapi>=0.115
 uvicorn[standard]>=0.30
