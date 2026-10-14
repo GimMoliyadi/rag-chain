@@ -53,3 +53,45 @@ def test_empty_and_validation():
         BM25Index(ROWS, k1=-1)
     with pytest.raises(ValueError):
         BM25Index(ROWS).search('test', top_k=0)
+
+
+def test_hybrid_adapter_emits_compatible_hits(monkeypatch):
+    """Check both dense and lexical hits return the public SearchResult shape."""
+    import sys
+    import types
+    from dataclasses import dataclass
+    from app.hybrid_retrieval import HybridRetriever
+
+    @dataclass
+    class FakeSearchResult:
+        score: float
+        chunk_id: int
+        document_id: int
+        chunk_index: int
+        title: str
+        file_path: str
+        heading: str
+        source: str
+        content: str
+        domain: str = ''
+        source_type: str = ''
+
+    monkeypatch.setitem(sys.modules, 'app.retriever', types.SimpleNamespace(SearchResult=FakeSearchResult))
+    row1 = dict(ROWS[0], document_id=10, chunk_index=0, file_path='债券.md', source='教材', source_type='md')
+    row2 = dict(ROWS[1], document_id=20, chunk_index=0, file_path='利率.md', source='教材', source_type='md')
+
+    class Dense:
+        last_debug = {'domain_empty_fallback': False}
+
+        def search(self, question, top_k=None, domains=None):
+            return [FakeSearchResult(0.87, 2, 20, 0, '货币政策', '利率.md', '央行政策', '教材',
+                                     row2['content'], domain='finance', source_type='md')]
+
+    hybrid = HybridRetriever(Dense(), [row1, row2])
+    hits = hybrid.search('债券票面利率', top_k=2, domains=['finance'])
+    assert len(hits) == 2
+    assert {hit.chunk_id for hit in hits} == {1, 2}
+    assert all(isinstance(hit, FakeSearchResult) for hit in hits)
+    assert all(0 <= hit.score <= 1 for hit in hits)
+    assert hybrid.last_debug['dense_candidates'] == 1
+    assert hybrid.last_debug['lexical_candidates'] > 0
