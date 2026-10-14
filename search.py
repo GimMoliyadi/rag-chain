@@ -14,6 +14,8 @@ import argparse
 import json
 
 from app.config import Settings
+from app.database import connect, get_chunks_for_reindex
+from app.hybrid_retrieval import HybridRetriever
 from app.embedding import get_embedding_client
 from app.knowledge_domains import load_router_terms
 from app.retriever import Retriever
@@ -27,6 +29,7 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=None, help="返回条数，默认用 .env 里的 TOP_K")
     parser.add_argument("--domains", default=None, help="只在这些知识域里检索，逗号分隔（手动指定，跳过 Router）")
     parser.add_argument("--router", action="store_true", help="先用 QueryRouter 判断知识域，再 scoped 检索")
+    parser.add_argument("--hybrid", action="store_true", help="实验性：BM25 + Dense + RRF（输出的是相对融合排名分数）")
     args = parser.parse_args()
     if args.router and args.domains:
         raise SystemExit("--router 和 --domains 只能二选一：一个是路由决定域，一个是手动指定域")
@@ -48,6 +51,17 @@ def main() -> None:
     print(f"向量库已有 {total} 个 chunk（embedding: {embedding.model_name}）")
     if total == 0:
         raise SystemExit("向量库是空的，先运行 python ingest.py 导入文档")
+
+    if args.hybrid:
+        conn = connect(settings.db_path_resolved)
+        try:
+            lexical_rows = get_chunks_for_reindex(conn)
+        finally:
+            conn.close()
+        if not lexical_rows:
+            raise SystemExit("SQLite 中没有可供 BM25 检索的 chunk，请先运行 python ingest.py")
+        retriever = HybridRetriever(retriever, lexical_rows)
+        print("实验模式：Hybrid BM25 + Dense + RRF（分数不是余弦相似度）")
 
     domains = args.domains.split(",") if args.domains else None
     decision = None
@@ -75,7 +89,8 @@ def main() -> None:
         content = hit.content
         preview = content if len(content) <= 300 else content[:300] + "…"
         print(f"\nTop {i}")
-        print(f"相似度 : {hit.score:.4f}")
+        label = "RRF分数" if args.hybrid else "相似度"
+        print(f"{label} : {hit.score:.4f}")
         print(f"文档   : {hit.title}")
         print(f"文件   : {hit.file_path}")
         print(f"领域   : {hit.domain} / {hit.source_type}")
