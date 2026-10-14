@@ -632,6 +632,9 @@ python scripts/retrieval_check.py                  # 300 个真实 chunk 建临�
 
 ## 评测结果怎么读（重要口径警告）
 
+新增的 `doc_recall_at_k` / `precision_at_k` / `ndcg_at_k` 是**文档级**排名指标：同一篇文档的多个 chunk 只算一次。原 `recall_at_k` 实际是“至少命中一篇相关文档”的 hit@k（按原始 chunk 位次计算），为确保历史 A/B 报告可比，保留旧字段与口径；`recall_all_at_5` 已修复多文档题只命中部分文档却误判为全命中的问题。新旧口径不可混用。指标实现及独立测试见 `app/eval_metrics.py`、`tests/test_eval_metrics.py`，开发说明见 [RANKING_METRICS.md](RANKING_METRICS.md)。
+
+
 `eval/retrieval_questions.json` 里有 32 道题，**全部 `verified: false`，还一道都没有人工确认过。**
 
 `eval_retrieval.py` 默认会跳过未确认的题目，所以直接跑会得到 0 道可计分题目，并提示

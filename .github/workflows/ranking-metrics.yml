@@ -1,0 +1,28 @@
+name: Ranking metrics tests
+
+on:
+  push:
+    branches:
+      - feat/verified-ranking-metrics-20261014
+  pull_request:
+    paths:
+      - "app/eval_metrics.py"
+      - "tests/test_eval_metrics.py"
+      - "eval_retrieval.py"
+      - ".github/workflows/ranking-metrics.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  metrics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install pytest
+      - run: python -m pytest --noconftest tests/test_eval_metrics.py -q
+      - run: python -m py_compile app/eval_metrics.py eval_retrieval.py

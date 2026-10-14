@@ -10,6 +10,10 @@ Settings -> embedding -> ChromaStore -> Retriever 的同一套依赖链，
     Recall@k     = 该题 expected_documents 里只要有任意一篇落在 Top-k，记 1，否则 0
     recall_all@k = expected_documents 全部落在 Top-k 才记 1（多文档题的真实难点）
     MRR@5        = 第一篇命中文档的排名倒数；5 名之外才命中记 0
+    doc_recall@k = Top-k 去重文档中命中的相关文档数 / 全部相关文档数
+    nDCG@k       = 文档级归一化折损累计增益（一个文档多个 chunk 只计一次）
+
+注意：原 Recall@k 实际是 hit@k，原值及排序位置继续保留，用于和旧基线比较。
 
 expected_documents 为空的题（category=unknown）不计入上面任何指标，
 单独列为覆盖度检查——它们考的是"敢不敢说不知道"，由 eval_rag.py 负责。
@@ -27,6 +31,7 @@ from pathlib import Path
 from app.config import Settings
 from app.context_filter import ContextSelection, prepare_context
 from app.embedding import get_embedding_client
+from app.eval_metrics import document_ranking_metrics
 from app.reranker import CrossEncoderReranker
 from app.retriever import Retriever, SearchResult
 from app.vectorstore import ChromaStore
@@ -186,7 +191,7 @@ def score_question(question: dict, hits: list[SearchResult], latency_ms: float) 
         "expected_documents": question["expected_documents"],
         "ranks": ranks,
         "first_rank": first,
-        "recall_all_at_5": 1 if found and all(r <= ALL_K for r in found) else 0,
+        "recall_all_at_5": 1 if ranks and all(r is not None and r <= ALL_K for r in ranks) else 0,
         "mrr5": round(1.0 / first, 4) if first is not None and first <= MRR_CUTOFF else 0.0,
         "latency_ms": round(latency_ms, 1),
         "keyword_hit": _keyword_hit(question, hits),
@@ -201,6 +206,13 @@ def score_question(question: dict, hits: list[SearchResult], latency_ms: float) 
             for i, h in enumerate(hits[:ALL_K])
         ],
     }
+    # Additional document-level metrics deduplicate repeated chunks from the same
+    # source. Legacy recall_at_k / MRR@5 retain their original *chunk* ranking.
+    result.update(document_ranking_metrics(
+        {path: 1.0 for path in expected_norm},
+        (_norm_path(hit.file_path) for hit in hits),
+        METRIC_KS,
+    ))
     for k in METRIC_KS:
         result[f"recall_at_{k}"] = 1 if first is not None and first <= k else 0
     return result
@@ -208,7 +220,11 @@ def score_question(question: dict, hits: list[SearchResult], latency_ms: float) 
 
 def _aggregate(results: list[dict]) -> dict:
     """把题目级结果压成一组均值。"""
-    metric_keys = [f"recall_at_{k}" for k in METRIC_KS] + ["recall_all_at_5", "mrr5"]
+    metric_keys = (
+        [f"recall_at_{k}" for k in METRIC_KS]
+        + ["recall_all_at_5", "mrr5"]
+        + [f"{name}_at_{k}" for name in ("hit", "doc_recall", "precision", "ndcg") for k in METRIC_KS]
+    )
     agg: dict = {"count": len(results)}
     for key in metric_keys:
         vals = [r[key] for r in results]
@@ -244,13 +260,15 @@ def _print_summary(label: str, agg: dict) -> None:
         f"{agg.get('recall_at_5') or 0:>10.2f}"
         f"{agg.get('recall_all_at_5') or 0:>10.2f}"
         f"{agg.get('mrr5') or 0:>8.3f}"
+        f"{agg.get('doc_recall_at_5') or 0:>12.3f}"
+        f"{agg.get('ndcg_at_5') or 0:>10.3f}"
         f"{agg.get('latency_ms_mean') or 0:>12.0f}"
     )
 
 
 def _print_header_row() -> None:
-    print("  模式              题目数  Recall@1  Recall@3  Recall@5  all@5    MRR@5  检索耗时ms")
-    print("  " + "-" * 70)
+    print("  模式              题目数  Recall@1  Recall@3  Recall@5  all@5    MRR@5   DocRecall@5    nDCG@5  检索耗时ms")
+    print("  " + "-" * 100)
 
 
 def _print_failures(results: list[dict]) -> None:
