@@ -17,7 +17,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from .chunker import Chunk
+from .chunker import Chunk, _split_sections
 from .knowledge_domains import DomainInfo
 from .parser import ParsedDocument
 
@@ -100,21 +100,68 @@ def upsert_document(
     conn: sqlite3.Connection,
     doc: ParsedDocument,
     domain_info: DomainInfo | None = None,
+    *,
+    commit: bool = True,
 ) -> tuple[int, bool, bool]:
     """写入或更新文档，返回 (document_id, changed, created)。
 
     changed=False 表示内容哈希没变、库里已经有这份内容，调用方可以跳过切块和向量化——
-    这就是增量 ingest 的核心：重复跑不会重复插库。
+    这就是增量 ingest 的核心：重复跑不会重复插库。正文没变但标题、标签、来源等
+    元数据变了时，仍会更新 documents 行；调用方可以只同步向量元数据，不必重新算向量。
     created=True 表示这是第一次入库（新文档），否则是内容变化后的更新。
 
     domain_info 传了就把知识域一并写入；不传（旧调用方）保持该列原值不动。
-    注意 changed=False 的早退分支发生在写入之前，所以"内容没变的老文档"
-    靠这里的写入拿不到 domain——它们由 refresh_domain_metadata 统一回填。
     """
     digest = content_hash(doc.content)
-    row = conn.execute("SELECT id, content_hash, domain, source_type FROM documents WHERE file_path = ?", (doc.file_path,)).fetchone()
+    row = conn.execute(
+        """
+        SELECT id, content_hash, title, folder, tags, source, created_at, updated_at,
+               domain, source_type
+          FROM documents
+         WHERE file_path = ?
+        """,
+        (doc.file_path,),
+    ).fetchone()
 
     if row and row["content_hash"] == digest:
+        # 正文 hash 相同不等于整篇文档没有变化：Obsidian 常见的改动只发生在
+        # frontmatter（title/tags/source）。这些字段会参与词面重排和引用展示，
+        # 必须同步到 SQLite；向量本身仍可复用。
+        tags_csv = ",".join(doc.tags)
+        domain = domain_info.domain if domain_info else row["domain"]
+        source_type = domain_info.source_type if domain_info else row["source_type"]
+        metadata = {
+            "title": doc.title,
+            "folder": doc.folder,
+            "tags": tags_csv,
+            "source": doc.source,
+            "created_at": doc.created_at,
+            "updated_at": doc.updated_at,
+            "domain": domain,
+            "source_type": source_type,
+        }
+        if any(row[key] != value for key, value in metadata.items()):
+            conn.execute(
+                """
+                UPDATE documents
+                   SET title = ?, folder = ?, tags = ?, source = ?,
+                       created_at = ?, updated_at = ?, domain = ?, source_type = ?
+                 WHERE id = ?
+                """,
+                (
+                    metadata["title"],
+                    metadata["folder"],
+                    metadata["tags"],
+                    metadata["source"],
+                    metadata["created_at"],
+                    metadata["updated_at"],
+                    metadata["domain"],
+                    metadata["source_type"],
+                    row["id"],
+                ),
+            )
+            if commit:
+                conn.commit()
         return row["id"], False, False
 
     tags_csv = ",".join(doc.tags)
@@ -132,7 +179,8 @@ def upsert_document(
             (doc.title, doc.folder, tags_csv, doc.source, doc.content,
              digest, doc.created_at, doc.updated_at, domain, source_type, row["id"]),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         return row["id"], True, False
 
     cur = conn.execute(
@@ -145,11 +193,81 @@ def upsert_document(
         (doc.title, doc.file_path, doc.folder, tags_csv, doc.source, doc.content,
          digest, doc.created_at, doc.updated_at, domain, source_type),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.lastrowid, True, True
 
 
-def delete_document(conn: sqlite3.Connection, document_id: int) -> bool:
+def get_document_metadata_by_path(
+    conn: sqlite3.Connection, file_path: str
+) -> dict | None:
+    """按相对路径读取文档元数据，供增量同步判断 metadata-only 变化。
+
+    不读取正文，也不把结果转成面向 API 的 tags 列表；调用方需要和 upsert
+    前后的数据库快照逐字段比较，因此这里保留 documents 表中的原始 CSV 值。
+    """
+    row = conn.execute(
+        """
+        SELECT id, content_hash, title, folder, tags, source, created_at, updated_at,
+               domain, source_type
+          FROM documents
+         WHERE file_path = ?
+        """,
+        (file_path,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def sync_derived_chunk_headings(
+    conn: sqlite3.Connection,
+    document_id: int,
+    content: str,
+    title: str,
+    *,
+    commit: bool = True,
+) -> int:
+    """同步由文档标题派生的 chunk heading，返回实际更新数。
+
+    ``chunk_markdown`` 只在一个 section 没有 Markdown 标题时使用文档标题作为
+    heading；真正的 ``#``/``##`` 章节标题必须保持不动。根据 chunk 的起始位置
+    判断其所属 section，避免用 ``heading == old_title`` 的字符串猜测误改真实章节。
+    正文不变时 chunk id、正文和位置都不变，这里只更新 SQLite 的 heading 列。
+    """
+    if not title:
+        return 0
+
+    sections = _split_sections(content)
+    rows = conn.execute(
+        """
+        SELECT id, start_position, heading
+          FROM chunks
+         WHERE document_id = ?
+         ORDER BY chunk_index
+        """,
+        (document_id,),
+    ).fetchall()
+
+    def section_heading_at(position: int) -> str | None:
+        for heading, start, end, _body_start in sections:
+            if start <= position < end:
+                return heading
+        return None
+
+    updates = [
+        (title, row["id"])
+        for row in rows
+        if section_heading_at(row["start_position"]) == "" and row["heading"] != title
+    ]
+    if not updates:
+        return 0
+
+    conn.executemany("UPDATE chunks SET heading = ? WHERE id = ?", updates)
+    if commit:
+        conn.commit()
+    return len(updates)
+
+
+def delete_document(conn: sqlite3.Connection, document_id: int, *, commit: bool = True) -> bool:
     """按 id 删掉一篇文档，chunks 靠外键级联一起删掉。
 
     返回 True 表示确实删到了一行，False 表示这个 id 本来就不在库里。
@@ -157,18 +275,26 @@ def delete_document(conn: sqlite3.Connection, document_id: int) -> bool:
     因为连接上开了 PRAGMA foreign_keys = ON，否则这条外键只是摆设。
     """
     cur = conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.rowcount > 0
 
 
-def replace_chunks(conn: sqlite3.Connection, document_id: int, chunks: list[Chunk]) -> int:
+def replace_chunks(
+    conn: sqlite3.Connection,
+    document_id: int,
+    chunks: list[Chunk],
+    *,
+    commit: bool = True,
+) -> int:
     """整体替换某个文档的切块结果，返回写入的块数。
 
     先删旧块再插新块，放在同一个事务里：
     切块策略变了或者文档改短了，旧的多余块不会残留。
     """
     now = _now()
-    with conn:  # with 连接 = 自动 commit/rollback
+
+    def _write() -> None:
         conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
         conn.executemany(
             """
@@ -181,6 +307,12 @@ def replace_chunks(conn: sqlite3.Connection, document_id: int, chunks: list[Chun
                 for i, c in enumerate(chunks)
             ],
         )
+
+    if commit:
+        with conn:  # with 连接 = 自动 commit/rollback
+            _write()
+    else:
+        _write()
     return len(chunks)
 
 

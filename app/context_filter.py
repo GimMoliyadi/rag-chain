@@ -1,6 +1,6 @@
 """retrieval 和 LLM context 之间的轻量清洗层。
 
-单独成模块而不是塞进 retriever，是因为检索层的职责只有一件——按相似度排序。
+单独成模块而不是塞进 retriever，是因为检索层的职责只有一件——按相关性排序。
 过滤和文本清理是另一件职责，混在一起就再也拿不回"原始检索结果"，
 评估时也就复现不出 baseline。
 
@@ -151,7 +151,7 @@ def strip_export_metadata(text: str) -> str:
 def prepare_context(hits: list[SearchResult], top_k: int) -> ContextSelection:
     """从候选命中里挑出最终进 context 的 top_k 条。
 
-    按相似度顺序遍历，导航 chunk 跳过，凑满 top_k 即停。
+    按检索器给出的相关性顺序遍历，导航 chunk 跳过，凑满 top_k 即停。
     不足 top_k 时返回剩余的全部——宁少不补垃圾。
     """
     selected: list[ContextChunk] = []

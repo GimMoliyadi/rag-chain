@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 项目根目录 = app/ 的上一级，也就是 requirements.txt 所在的那一层
@@ -77,8 +78,11 @@ class Settings(BaseSettings):
     # 带保留回答 / 直接拒答。判定靠 LLM 读资料，不靠 cosine 分数阈值——
     # 实测有答案与无答案查询的分数区间高度重叠，固定阈值必然大面积误判。
     evidence_gate_enabled: bool = False
-    # 单条 chunk 进入 Judge Prompt 前的最大字符数。Judge 只需要判断
-    # 「有没有相关证据」，不需要逐字核对全文，截断能把 Judge 请求压小、变快。
+    # 严格模式：Evidence Gate 调用/解析失败时拒答，不把未确认的资料交给生成模型。
+    # 只在 evidence_gate_enabled=true 时有意义；默认关闭以保留历史行为。
+    strict_evidence_enabled: bool = False
+    # 独立调用 EvidenceGate 时的单条 chunk 字符上限。RAGEngine 传入最终
+    # context 后不再二次截断，确保 Judge 和生成模型看到相同的清洗后证据。
     evidence_judge_chunk_chars: int = 600
 
     # ---- LLM Router fallback（规则零命中时才启用）----
@@ -136,7 +140,7 @@ class Settings(BaseSettings):
     # openai         = OpenAI 兼容接口
     embedding_provider: str = "local"
     embedding_base_url: str = ""
-    embedding_api_key: str = ""
+    embedding_api_key: str = Field(default="", repr=False)
     embedding_model: str = ""
     embedding_dim: int = 256    # 仅 local 模式使用
 
@@ -161,7 +165,7 @@ class Settings(BaseSettings):
     # anthropic = Anthropic Messages API；模型/端点/凭证三处取值见下面的 anthropic_* 属性
     llm_provider: str = "mock"
     llm_base_url: str = ""
-    llm_api_key: str = ""
+    llm_api_key: str = Field(default="", repr=False)
     llm_model: str = ""
     # Anthropic Messages API 里 max_tokens 是必填项。4096 的依据：本知识库单轮回答
     # 实测几百 token，留足长引用回答的余量；不给更大的值，因为代理按 max_tokens
@@ -295,6 +299,11 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"EVIDENCE_RESCUE_K 必须是正整数，当前：{self.evidence_rescue_k}"
                 )
+        if self.strict_evidence_enabled and not self.evidence_gate_enabled:
+            raise ValueError(
+                "STRICT_EVIDENCE_ENABLED=true 需要先开启 EVIDENCE_GATE_ENABLED："
+                "严格模式必须先完成证据评审。"
+            )
         # 精排只在显式开启时才有意义，所以校验也只在开启时触发；
         # 关着的时候填了错的设备名不该让服务起不来。
         if self.reranker_enabled:

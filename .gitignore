@@ -23,6 +23,7 @@ eval/regression_raw_*.json
 # 真实题集：32 道题面 + expected_documents 暴露私人知识库的目录结构。
 # 进库的只有同构的 eval/retrieval_questions.example.json（5 道虚构题，只做 schema 说明）。
 eval/retrieval_questions.json
+eval/questions_v2.json
 
 # probe 脚本的临时输出和日志：数字会随时间失效，不适合进版本库
 logs_*.txt

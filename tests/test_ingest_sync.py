@@ -14,12 +14,15 @@ local provider 是确定性的哈希向量：同一段文本每次都得到同�
 """
 from __future__ import annotations
 
+import pytest
+
 from app.database import connect
-from app.embedding import get_embedding_client
-from app.ingest import run_ingest
+from app.embedding import HashingEmbedding, get_embedding_client
+from app.ingest import VectorCleanupError, run_ingest
+from app.retriever import EmbeddingMismatchError, Retriever
 from app.vectorstore import ChromaStore
 
-from conftest import CONTRACT_MD
+from conftest import CONTRACT_MD, MVP_MD
 
 # 删掉最后一个小节后的版本，用来模拟"文档被改短"
 CONTRACT_MD_SHORT = CONTRACT_MD.split("## 免责事由")[0]
@@ -105,6 +108,223 @@ def test_second_ingest_skips_unchanged_documents(settings):
         assert second.removed == 0
         assert second.chunks_written == 0
         assert store.count() == count_before
+    finally:
+        store.close()
+
+
+def test_metadata_only_change_syncs_sqlite_and_chroma_without_reembedding(
+    settings, fake_vault, monkeypatch
+):
+    """只改 frontmatter 时同步词面元数据，复用原向量。"""
+    embedding = get_embedding_client(settings)
+    store = ChromaStore(settings.chroma_path_resolved)
+    target = fake_vault / "法律" / "合同违约.md"
+    try:
+        _ingest(settings, embedding, store)
+        conn = _sqlite(settings)
+        try:
+            document_id = conn.execute(
+                "SELECT id FROM documents WHERE file_path = ?", ("法律/合同违约.md",)
+            ).fetchone()["id"]
+            old_hash = conn.execute(
+                "SELECT content_hash FROM documents WHERE id = ?", (document_id,)
+            ).fetchone()["content_hash"]
+        finally:
+            conn.close()
+        old_vectors = store.get_document_chunks(document_id)
+        old_count = store.count()
+
+        target.write_text(
+            CONTRACT_MD.replace("title: 合同违约的认定与救济", "title: 精准合同检索")
+            .replace("  - 合同法", "  - 精准标签")
+            .replace("source: 民法典笔记", "source: 更新后的民法典笔记"),
+            encoding="utf-8",
+        )
+
+        embed_calls = 0
+
+        def must_not_embed(texts):
+            nonlocal embed_calls
+            embed_calls += 1
+            raise AssertionError("metadata-only ingest must not recompute embeddings")
+
+        monkeypatch.setattr(embedding, "embed", must_not_embed)
+        stats = _ingest(settings, embedding, store)
+
+        assert stats.failed == 0
+        assert stats.updated == 0
+        assert stats.unchanged == 2
+        assert stats.metadata_updated == 1
+        assert stats.chunks_written == 0
+        assert embed_calls == 0
+        assert store.count() == old_count
+
+        conn = _sqlite(settings)
+        try:
+            row = conn.execute(
+                "SELECT title, tags, source, content_hash FROM documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()
+            assert tuple(row) == ("精准合同检索", "法律,精准标签", "更新后的民法典笔记", old_hash)
+        finally:
+            conn.close()
+
+        new_vectors = store.get_document_chunks(document_id)
+        assert [row["content"] for row in new_vectors] == [row["content"] for row in old_vectors]
+        assert [row["embedding"] for row in new_vectors] == [row["embedding"] for row in old_vectors]
+        assert [row["heading"] for row in new_vectors] == [row["heading"] for row in old_vectors]
+        assert {row["title"] for row in new_vectors} == {"精准合同检索"}
+        assert {row["tags"] for row in new_vectors} == {"法律,精准标签"}
+        assert {row["source"] for row in new_vectors} == {"更新后的民法典笔记"}
+    finally:
+        store.close()
+
+
+def test_metadata_only_sync_failure_rolls_back_and_retries_without_reembedding(
+    settings, fake_vault, monkeypatch
+):
+    """Chroma 元数据写失败时两边保持旧版本，下一轮可重试。"""
+    embedding = get_embedding_client(settings)
+    store = ChromaStore(settings.chroma_path_resolved)
+    target = fake_vault / "法律" / "合同违约.md"
+    try:
+        _ingest(settings, embedding, store)
+        conn = _sqlite(settings)
+        try:
+            document_id = conn.execute(
+                "SELECT id FROM documents WHERE file_path = ?", ("法律/合同违约.md",)
+            ).fetchone()["id"]
+            old_metadata = tuple(
+                conn.execute(
+                    "SELECT title, tags, source FROM documents WHERE id = ?", (document_id,)
+                ).fetchone()
+            )
+        finally:
+            conn.close()
+        old_vectors = store.get_document_chunks(document_id)
+        target.write_text(
+            CONTRACT_MD.replace("title: 合同违约的认定与救济", "title: 可重试的合同标题")
+            .replace("source: 民法典笔记", "source: 可重试的新来源"),
+            encoding="utf-8",
+        )
+
+        original_update = store.update_chunk_metadata
+        failed_once = False
+        embed_calls = 0
+
+        def fail_once(rows):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise RuntimeError("simulated metadata write failure")
+            return original_update(rows)
+
+        def count_only(texts):
+            nonlocal embed_calls
+            embed_calls += 1
+            raise AssertionError("metadata-only retry must not recompute embeddings")
+
+        monkeypatch.setattr(store, "update_chunk_metadata", fail_once)
+        monkeypatch.setattr(embedding, "embed", count_only)
+        failed = _ingest(settings, embedding, store)
+        assert failed.failed == 1
+        assert failed.metadata_updated == 0
+        assert failed.updated == 0
+        assert embed_calls == 0
+
+        conn = _sqlite(settings)
+        try:
+            assert tuple(
+                conn.execute(
+                    "SELECT title, tags, source FROM documents WHERE id = ?", (document_id,)
+                ).fetchone()
+            ) == old_metadata
+        finally:
+            conn.close()
+        assert store.get_document_chunks(document_id) == old_vectors
+
+        monkeypatch.setattr(store, "update_chunk_metadata", original_update)
+        retried = _ingest(settings, embedding, store)
+        assert retried.failed == 0
+        assert retried.metadata_updated == 1
+        assert retried.updated == 0
+        assert embed_calls == 0
+        assert store.get_document_chunks(document_id)[0]["title"] == "可重试的合同标题"
+    finally:
+        store.close()
+
+
+def test_metadata_only_title_change_updates_derived_heading_without_rechunking(
+    settings, fake_vault, monkeypatch
+):
+    """无 Markdown 章节时 heading 来自文档标题，标题改动也要同步它。"""
+    target = fake_vault / "无标题.md"
+    initial = "---\ntitle: 初始文档标题\ntags: [测试]\n---\n\n这是一篇没有 Markdown 标题的正文。\n第二句仍属于同一个正文块。\n"
+    target.write_text(initial, encoding="utf-8")
+    embedding = get_embedding_client(settings)
+    store = ChromaStore(settings.chroma_path_resolved)
+    try:
+        _ingest(settings, embedding, store)
+        conn = _sqlite(settings)
+        try:
+            document_id = conn.execute(
+                "SELECT id FROM documents WHERE file_path = ?", ("无标题.md",)
+            ).fetchone()["id"]
+            old_chunk = conn.execute(
+                """
+                SELECT id, content, heading, start_position, end_position
+                  FROM chunks WHERE document_id = ? ORDER BY chunk_index
+                """,
+                (document_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert old_chunk["heading"] == "初始文档标题"
+        old_vectors = store.get_document_chunks(document_id)
+        assert len(old_vectors) == 1
+
+        target.write_text(initial.replace("title: 初始文档标题", "title: 更新后的文档标题"), encoding="utf-8")
+        embed_calls = 0
+
+        def must_not_embed(texts):
+            nonlocal embed_calls
+            embed_calls += 1
+            raise AssertionError("metadata-only title change must not recompute embeddings")
+
+        monkeypatch.setattr(embedding, "embed", must_not_embed)
+        stats = _ingest(settings, embedding, store)
+
+        assert stats.failed == 0
+        assert stats.metadata_updated == 1
+        assert stats.updated == 0
+        assert stats.chunks_written == 0
+        assert embed_calls == 0
+
+        conn = _sqlite(settings)
+        try:
+            new_chunk = conn.execute(
+                """
+                SELECT id, content, heading, start_position, end_position
+                  FROM chunks WHERE document_id = ? ORDER BY chunk_index
+                """,
+                (document_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert tuple(new_chunk) == (
+            old_chunk["id"],
+            old_chunk["content"],
+            "更新后的文档标题",
+            old_chunk["start_position"],
+            old_chunk["end_position"],
+        )
+
+        new_vectors = store.get_document_chunks(document_id)
+        assert [row["chunk_id"] for row in new_vectors] == [row["chunk_id"] for row in old_vectors]
+        assert [row["content"] for row in new_vectors] == [row["content"] for row in old_vectors]
+        assert [row["embedding"] for row in new_vectors] == [row["embedding"] for row in old_vectors]
+        assert new_vectors[0]["title"] == "更新后的文档标题"
+        assert new_vectors[0]["heading"] == "更新后的文档标题"
     finally:
         store.close()
 
@@ -301,5 +521,338 @@ def test_failed_file_is_not_treated_as_deleted(settings, fake_vault, monkeypatch
             conn.close()
         # 向量还在，说明没有误判成删除
         assert _still_indexed(store, embedding, old_texts) == old_texts
+    finally:
+        store.close()
+
+
+def test_embedding_failure_rolls_back_document_for_retry(settings, fake_vault, monkeypatch):
+    """向量计算失败时保留旧 SQLite/向量，下一次扫描仍能重试该文档。"""
+    embedding = get_embedding_client(settings)
+    store = ChromaStore(settings.chroma_path_resolved)
+    target = fake_vault / "法律" / "合同违约.md"
+    try:
+        _ingest(settings, embedding, store)
+        conn = _sqlite(settings)
+        try:
+            old_content = conn.execute(
+                "SELECT content FROM documents WHERE file_path = ?", ("法律/合同违约.md",)
+            ).fetchone()["content"]
+            old_chunks = _chunk_texts(conn, "法律/合同违约.md")
+        finally:
+            conn.close()
+        old_vector_count = store.count()
+
+        target.write_text(CONTRACT_MD + "\n\nretryable addition.", encoding="utf-8")
+        original_embed = embedding.embed
+
+        def fail_embedding(texts):
+            return []
+
+        monkeypatch.setattr(embedding, "embed", fail_embedding)
+        failed = _ingest(settings, embedding, store)
+        assert failed.failed == 1
+        assert failed.updated == 0
+        assert failed.chunks_written == 0
+        assert "Embedding returned 0 vectors" in failed.errors[0]
+
+        conn = _sqlite(settings)
+        try:
+            row = conn.execute(
+                "SELECT content FROM documents WHERE file_path = ?", ("法律/合同违约.md",)
+            ).fetchone()
+            assert row["content"] == old_content
+            assert _chunk_texts(conn, "法律/合同违约.md") == old_chunks
+        finally:
+            conn.close()
+        assert store.count() == old_vector_count
+
+        monkeypatch.setattr(embedding, "embed", original_embed)
+        retried = _ingest(settings, embedding, store)
+        assert retried.failed == 0
+        assert retried.updated == 1
+        conn = _sqlite(settings)
+        try:
+            new_chunks = _chunk_texts(conn, "法律/合同违约.md")
+        finally:
+            conn.close()
+        assert _still_indexed(store, embedding, new_chunks) == new_chunks
+    finally:
+        store.close()
+
+
+def test_partial_vector_write_is_cleaned_and_retryable(settings, fake_vault, monkeypatch):
+    """部分写入失败后，旧版本仍可检索，新版本可以重试。"""
+    embedding = get_embedding_client(settings)
+    store = ChromaStore(settings.chroma_path_resolved)
+    target = fake_vault / "法律" / "合同违约.md"
+    try:
+        _ingest(settings, embedding, store)
+        conn = _sqlite(settings)
+        try:
+            old_chunks = _chunk_texts(conn, "法律/合同违约.md")
+            other_chunks = _chunk_texts(conn, "创业/MVP.md")
+        finally:
+            conn.close()
+        target.write_text(CONTRACT_MD + "\n\npartial write retry.", encoding="utf-8")
+
+        original_upsert = store.upsert_chunks
+        failed_once = False
+
+        def partial_upsert(rows):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                original_upsert(rows[:1])
+                raise RuntimeError("simulated Chroma write failure")
+            original_upsert(rows)
+
+        monkeypatch.setattr(store, "upsert_chunks", partial_upsert)
+        failed = _ingest(settings, embedding, store)
+        assert failed.failed == 1
+        assert _still_indexed(store, embedding, old_chunks) == old_chunks
+        assert _still_indexed(store, embedding, other_chunks) == other_chunks
+
+        monkeypatch.setattr(store, "upsert_chunks", original_upsert)
+        retried = _ingest(settings, embedding, store)
+        assert retried.failed == 0
+        assert retried.updated == 1
+        conn = _sqlite(settings)
+        try:
+            new_chunks = _chunk_texts(conn, "法律/合同违约.md")
+        finally:
+            conn.close()
+        assert _still_indexed(store, embedding, new_chunks) == new_chunks
+    finally:
+        store.close()
+
+
+def test_vector_cleanup_failure_aborts_batch_before_next_document(settings, fake_vault, monkeypatch):
+    """清理失败时中止整批 ingest，避免回滚后的文档 id 被后续文件复用。"""
+    embedding = get_embedding_client(settings)
+    store = ChromaStore(settings.chroma_path_resolved)
+    target = fake_vault / "法律" / "合同违约.md"
+    other = fake_vault / "创业" / "MVP.md"
+    try:
+        _ingest(settings, embedding, store)
+        conn = _sqlite(settings)
+        try:
+            old_rows = {
+                row["file_path"]: row["content"]
+                for row in conn.execute("SELECT file_path, content FROM documents")
+            }
+        finally:
+            conn.close()
+        target.write_text(CONTRACT_MD + "\n\ncleanup failure.", encoding="utf-8")
+        other.write_text(MVP_MD + "\n\nshould not be processed.", encoding="utf-8")
+
+        original_upsert = store.upsert_chunks
+        original_delete = store.delete_by_document
+        delete_calls = 0
+
+        def partial_upsert(rows):
+            original_upsert(rows[:1])
+            raise RuntimeError("simulated Chroma write failure")
+
+        def fail_cleanup(document_id):
+            nonlocal delete_calls
+            delete_calls += 1
+            if delete_calls == 2:
+                raise RuntimeError("simulated cleanup failure")
+            return original_delete(document_id)
+
+        monkeypatch.setattr(store, "upsert_chunks", partial_upsert)
+        monkeypatch.setattr(store, "delete_by_document", fail_cleanup)
+        with pytest.raises(VectorCleanupError):
+            _ingest(settings, embedding, store)
+        assert delete_calls == 2
+        assert store.read_index_info() is None
+        with pytest.raises(EmbeddingMismatchError):
+            Retriever(embedding, store).search("合同违约")
+
+        conn = _sqlite(settings)
+        try:
+            rows = {
+                row["file_path"]: row["content"]
+                for row in conn.execute("SELECT file_path, content FROM documents")
+            }
+        finally:
+            conn.close()
+        assert rows == old_rows
+    finally:
+        store.close()
+
+
+def test_embedding_mismatch_refuses_ingest_without_changes(settings):
+    """更换 embedding 模型时，增量 ingest 必须先拒绝，不能覆盖指纹或混入向量。"""
+    old_embedding = HashingEmbedding(256)
+    new_embedding = HashingEmbedding(128)
+    store = ChromaStore(settings.chroma_path_resolved)
+    try:
+        _ingest(settings, old_embedding, store)
+        before_info = store.read_index_info()
+        before_count = store.count()
+        conn = _sqlite(settings)
+        try:
+            before_docs = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT file_path, content, content_hash FROM documents ORDER BY id"
+                )
+            ]
+            before_chunks = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT document_id, chunk_index, content FROM chunks ORDER BY id"
+                )
+            ]
+        finally:
+            conn.close()
+
+        with pytest.raises(EmbeddingMismatchError):
+            _ingest(settings, new_embedding, store)
+
+        assert store.read_index_info() == before_info
+        assert store.count() == before_count
+        conn = _sqlite(settings)
+        try:
+            assert [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT file_path, content, content_hash FROM documents ORDER BY id"
+                )
+            ] == before_docs
+            assert [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT document_id, chunk_index, content FROM chunks ORDER BY id"
+                )
+            ] == before_chunks
+        finally:
+            conn.close()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("change", ["update", "empty", "delete"])
+def test_sqlite_commit_failure_restores_vectors(settings, fake_vault, monkeypatch, change):
+    import app.ingest as ingest_module
+
+    embedding = get_embedding_client(settings)
+    store = ChromaStore(settings.chroma_path_resolved)
+    target = fake_vault / "法律" / "合同违约.md"
+    try:
+        _ingest(settings, embedding, store)
+        conn = _sqlite(settings)
+        try:
+            document_id = conn.execute(
+                "SELECT id FROM documents WHERE file_path = ?", ("法律/合同违约.md",)
+            ).fetchone()[0]
+            old_document = tuple(conn.execute(
+                "SELECT * FROM documents WHERE id = ?", (document_id,)
+            ).fetchone())
+            old_chunks = _chunk_texts(conn, "法律/合同违约.md")
+        finally:
+            conn.close()
+        old_vectors = store.get_document_chunks(document_id)
+        old_count = store.count()
+        if change == "delete":
+            target.unlink()
+        else:
+            target.write_text(
+                EMPTY_MD if change == "empty" else CONTRACT_MD + "\n\n新版本内容。",
+                encoding="utf-8",
+            )
+
+        class FailOneCommit:
+            def __init__(self, connection):
+                self.connection = connection
+                self.failed = False
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def commit(self):
+                if self.connection.in_transaction and not self.failed:
+                    self.failed = True
+                    raise RuntimeError("simulated SQLite commit failure")
+                self.connection.commit()
+
+        original_connect = ingest_module.connect
+        monkeypatch.setattr(ingest_module, "connect", lambda path: FailOneCommit(original_connect(path)))
+        failed = _ingest(settings, embedding, store)
+        assert failed.failed == 1
+        assert failed.updated == failed.removed == 0
+        assert store.count() == old_count
+        assert store.get_document_chunks(document_id) == old_vectors
+        assert _still_indexed(store, embedding, old_chunks) == old_chunks
+        conn = _sqlite(settings)
+        try:
+            assert tuple(conn.execute(
+                "SELECT * FROM documents WHERE id = ?", (document_id,)
+            ).fetchone()) == old_document
+        finally:
+            conn.close()
+
+        monkeypatch.setattr(ingest_module, "connect", original_connect)
+        retried = _ingest(settings, embedding, store)
+        assert retried.failed == 0
+        assert (retried.removed if change == "delete" else retried.updated) == 1
+    finally:
+        store.close()
+
+
+def test_failed_new_document_leaves_no_vectors(settings, fake_vault, monkeypatch):
+    embedding = get_embedding_client(settings)
+    store = ChromaStore(settings.chroma_path_resolved)
+    try:
+        _ingest(settings, embedding, store)
+        old_count = store.count()
+        (fake_vault / "new.md").write_text(CONTRACT_MD, encoding="utf-8")
+        original_upsert = store.upsert_chunks
+        failed_once = False
+
+        def fail_once(rows):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                original_upsert(rows[:1])
+                raise RuntimeError("simulated new document failure")
+            original_upsert(rows)
+
+        monkeypatch.setattr(store, "upsert_chunks", fail_once)
+        failed = _ingest(settings, embedding, store)
+        assert failed.failed == 1
+        assert store.count() == old_count
+        conn = _sqlite(settings)
+        try:
+            assert conn.execute("SELECT id FROM documents WHERE file_path = 'new.md'").fetchone() is None
+        finally:
+            conn.close()
+        monkeypatch.setattr(store, "upsert_chunks", original_upsert)
+        retried = _ingest(settings, embedding, store)
+        assert retried.failed == 0
+        assert retried.added == 1
+    finally:
+        store.close()
+
+
+def test_vector_restore_failure_invalidates_index(settings, fake_vault, monkeypatch):
+    embedding = get_embedding_client(settings)
+    store = ChromaStore(settings.chroma_path_resolved)
+    try:
+        _ingest(settings, embedding, store)
+        (fake_vault / "法律" / "合同违约.md").write_text(CONTRACT_MD + "\n\n更新。", encoding="utf-8")
+        original_upsert = store.upsert_chunks
+
+        def fail_every_write(rows):
+            original_upsert(rows[:1])
+            raise RuntimeError("simulated persistent write failure")
+
+        monkeypatch.setattr(store, "upsert_chunks", fail_every_write)
+        with pytest.raises(VectorCleanupError, match="recovery failed"):
+            _ingest(settings, embedding, store)
+        assert store.read_index_info() is None
+        with pytest.raises(EmbeddingMismatchError):
+            Retriever(embedding, store).search("合同违约")
     finally:
         store.close()

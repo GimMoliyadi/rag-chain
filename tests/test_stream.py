@@ -150,7 +150,7 @@ def test_stream_empty_knowledge_base(settings):
     done = _at(events, "done")["data"]
     assert _at(events, "sources")["data"]["sources"] == []
     assert done["used_chunks"] == 0
-    assert "知识库中目前没有足够的信息" in done["answer"]
+    assert "本次检索没有返回可用资料" in done["answer"]
 
 
 class _ExplodingLLM:
@@ -171,6 +171,16 @@ class _ExplodingRetriever:
 
     def search(self, question, top_k=None, domains=None):
         raise ValueError("检索库不可用")
+
+
+class _ExplodingRouter:
+    def route(self, question):
+        raise RuntimeError("路由器不可用")
+
+
+class _ExplodingEvidenceGate:
+    def judge(self, question, hits, personal_context=None, evidence_context=None):
+        raise RuntimeError("证据评审不可用")
 
 
 def test_stream_error_after_partial_answer(settings, ingested):
@@ -199,6 +209,27 @@ def test_stream_error_during_retrieval(client):
     assert names == ["routing_completed", "retrieval_started", "error"]
     assert "done" not in names
     assert "检索库不可用" in _at(events, "error")["data"]["message"]
+
+
+def test_stream_error_during_routing(client):
+    client.app.state.rag._router = _ExplodingRouter()
+
+    events = _stream(client)
+
+    assert [event["event"] for event in events] == ["error"]
+    assert events[0]["data"]["message"] == "路由器不可用"
+
+
+def test_stream_error_during_evidence_review(client):
+    client.app.state.rag._evidence_gate = _ExplodingEvidenceGate()
+
+    events = _stream(client)
+    names = [event["event"] for event in events]
+
+    assert names[-1] == "error"
+    assert "sources" in names
+    assert "generation_started" not in names
+    assert _at(events, "error")["data"]["message"] == "证据评审不可用"
 
 
 def test_stream_rejects_empty_question(client):

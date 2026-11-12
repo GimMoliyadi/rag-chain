@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import time
 
+from app.citations import citation_warning
 from app.config import Settings
 from app.engine import build_engine
 from app.evidence import STATUS_INSUFFICIENT
@@ -49,6 +50,9 @@ def print_advisor_info(result: RAGAnswer) -> None:
     打印而不是藏在 debug 日志里：CLI 的用途之一就是真实测试时人眼核对
     每个阶段发生了什么，延迟数字直接印出来才不会被质疑「掩盖开销」。
     """
+    warning = citation_warning(result.citation_check)
+    if warning:
+        print(f"\n[citations] {warning}")
     if result.route is not None:
         print(f"\n[router] mode={result.route.mode} domains={result.route.domains} "
               f"origin={result.route.origin} confidence={result.route.confidence:.2f}")
@@ -91,7 +95,7 @@ def print_sources(result: RAGAnswer, elapsed: float) -> None:
             if len(content) <= SOURCE_PREVIEW_CHARS
             else content[:SOURCE_PREVIEW_CHARS] + "…"
         )
-        print(f"\n[{source.index}] 相似度 {source.score:.4f}")
+        print(f"\n[{source.index}] 相关性分数 {source.score:.4f}")
         print(f"    文档：{source.title}{heading}")
         print(f"    文件：{source.file_path}")
         print(f"    原文：{preview}")

@@ -79,6 +79,7 @@ def fake_vault(tmp_path: Path) -> Path:
 def settings(fake_vault: Path, tmp_path: Path) -> Settings:
     """把数据库和向量库都重定向到临时目录，provider 固定用离线的 local / mock。"""
     return Settings(
+        _env_file=None,
         vault_path=str(fake_vault),
         db_path=str(tmp_path / "test.db"),
         chroma_path=str(tmp_path / "chroma"),

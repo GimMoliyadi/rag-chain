@@ -36,6 +36,11 @@ class FakeRetriever:
         return [hit for hit in self.pools.get(top_k, [])][:top_k]
 
 
+class ExplodingRetriever:
+    def search(self, question: str, top_k: int = 5, domains: list[str] | None = None):
+        raise RuntimeError("救援检索不可用")
+
+
 def _hit(chunk_id: int, content: str) -> SearchResult:
     return SearchResult(
         score=0.8 - 0.01 * chunk_id, chunk_id=chunk_id, document_id=1, chunk_index=chunk_id,
@@ -67,7 +72,7 @@ def test_rescue_disabled_refuses_without_extra_call():
 
     result = engine.answer("问题？")
 
-    assert "没有足够资料" in result.answer
+    assert "本次检索到的资料不足以支持" in result.answer
     assert result.evidence is not None and result.evidence.status == "insufficient"
     assert len(llm.calls) == 1
     assert result.timings["first_evidence_status"] == "insufficient"
@@ -104,6 +109,40 @@ def test_rescue_recovers_a_partial_answer():
     assert "运动规律的分类" in llm.calls[2][1]["content"]
 
 
+def test_rescue_judge_sees_the_same_final_context_as_generation():
+    long_content = "前置说明。" + ("补充文字。" * 140) + "救援关键证据在这里。"
+    rescue_hit = _hit(8, long_content)
+    llm = ScriptedLLM([_verdict("insufficient"), _verdict("sufficient"), "救援回答"])
+    engine = _build(
+        FakeRetriever({5: FIRST_FIVE}), llm,
+        evidence_gate=EvidenceGate(llm),
+        evidence_rescue_enabled=True, evidence_rescue_k=20,
+        rescue_retriever=FakeRetriever({20: FIRST_FIVE + [rescue_hit]}),
+    )
+
+    result = engine.answer("问题？")
+
+    assert result.answer == "救援回答"
+    rescue_judge_user = llm.calls[1][1]["content"]
+    generation_user = llm.calls[2][1]["content"]
+    assert "救援关键证据在这里" in rescue_judge_user
+    assert "救援关键证据在这里" in generation_user
+
+
+def test_rescue_stream_reports_retrieval_failure_as_error():
+    llm = ScriptedLLM([_verdict("insufficient")])
+    engine = _build(
+        FakeRetriever({5: FIRST_FIVE}), llm,
+        evidence_gate=EvidenceGate(llm),
+        evidence_rescue_enabled=True, evidence_rescue_k=20,
+        rescue_retriever=ExplodingRetriever(),
+    )
+
+    events = list(engine.answer_stream("问题？"))
+
+    assert events[-1] == {"event": "error", "data": {"message": "救援检索不可用"}}
+
+
 def test_rescue_still_insufficient_refuses_normally():
     """库真的没有这块内容时，救援后仍然是 insufficient，不能因为池子变大就硬判 sufficient。"""
     llm = ScriptedLLM([_verdict("insufficient"), _verdict("insufficient")])
@@ -116,7 +155,7 @@ def test_rescue_still_insufficient_refuses_normally():
 
     result = engine.answer("问题？")
 
-    assert "没有足够资料" in result.answer
+    assert "本次检索到的资料不足以支持" in result.answer
     assert result.evidence is not None and result.evidence.status == "insufficient"
     assert result.timings["rescue_triggered"] is True
     assert result.timings["final_evidence_status"] == "insufficient"

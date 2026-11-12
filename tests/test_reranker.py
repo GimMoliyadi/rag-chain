@@ -102,6 +102,15 @@ def test_rerank_empty_hits_is_noop():
     assert reranker.stats.calls == 0
 
 
+def test_metadata_rerank_keeps_the_original_evidence(hits):
+    model = FakeModel([1.0, 9.0, 5.0])
+    reranked = CrossEncoderReranker(model=model, include_metadata=True).rerank("问题", hits)
+
+    assert model.last_pairs[0] == ("问题", "文档：文档0\n章节：第一节\n\n内容 0")
+    assert reranked[0].content == "内容 1"
+    assert hits[0].content == "内容 0"
+
+
 def test_rerank_passes_question_and_content_pairs(hits):
     """喂给模型的必须是 (question, content)，用错字段等于白排。"""
     model = FakeModel([1.0, 2.0, 3.0])
@@ -219,7 +228,7 @@ def test_resolve_device_auto_returns_real_device(monkeypatch):
 
 def test_config_defaults_keep_reranker_off():
     """RERANKER_ENABLED 必须默认 false：baseline 要随时复现，显存不该被占。"""
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.reranker_enabled is False
     assert settings.reranker_candidate_top_k == 50
     assert settings.reranker_batch_size >= 1

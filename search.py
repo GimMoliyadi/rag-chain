@@ -15,6 +15,7 @@ import json
 
 from app.config import Settings
 from app.embedding import get_embedding_client
+from app.engine import build_reranker
 from app.knowledge_domains import load_router_terms
 from app.retriever import Retriever
 from app.router import QueryRouter
@@ -22,7 +23,7 @@ from app.vectorstore import ChromaStore
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="在知识库向量索引里做相似度检索（不调用 LLM）")
+    parser = argparse.ArgumentParser(description="在知识库向量索引里按综合相关性检索（不调用 LLM）")
     parser.add_argument("question", help="要检索的问题或关键词")
     parser.add_argument("--k", type=int, default=None, help="返回条数，默认用 .env 里的 TOP_K")
     parser.add_argument("--domains", default=None, help="只在这些知识域里检索，逗号分隔（手动指定，跳过 Router）")
@@ -42,6 +43,8 @@ def main() -> None:
         default_top_k=settings.top_k,
         diversity_enabled=settings.diversity_enabled,
         max_chunks_per_document=settings.max_chunks_per_document,
+        reranker=build_reranker(settings),
+        reranker_candidate_top_k=settings.reranker_candidate_top_k,
     )
 
     total = store.count()
@@ -75,7 +78,7 @@ def main() -> None:
         content = hit.content
         preview = content if len(content) <= 300 else content[:300] + "…"
         print(f"\nTop {i}")
-        print(f"相似度 : {hit.score:.4f}")
+        print(f"原始向量相似度 : {hit.score:.4f}")
         print(f"文档   : {hit.title}")
         print(f"文件   : {hit.file_path}")
         print(f"领域   : {hit.domain} / {hit.source_type}")

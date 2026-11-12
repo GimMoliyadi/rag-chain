@@ -28,16 +28,19 @@ from .database import (
     connect,
     delete_document,
     get_chunks,
-    get_document,
     get_chunks_for_reindex,
+    get_document,
+    get_document_metadata_by_path,
     init_db,
     list_document_ids_by_path,
     replace_chunks,
+    sync_derived_chunk_headings,
     upsert_document,
 )
 from .embedding import BaseEmbedding
 from .knowledge_domains import DomainInfo, load_domain_mapping, resolve_domain
 from .parser import ParsedDocument, iter_markdown_files, parse_markdown
+from .retriever import _check_index_matches
 from .vectorstore import ChromaStore
 
 # 全量重建时一次在内存里保留多少 chunk 的向量。
@@ -54,11 +57,16 @@ class IngestStats:
     added: int = 0           # 首次入库
     updated: int = 0         # 内容变化被更新
     unchanged: int = 0       # 内容没变被跳过（增量生效的证据）
+    metadata_updated: int = 0  # 正文没变、但 SQLite/Chroma 元数据已同步
     removed: int = 0         # 文件已从 Vault 删掉、库里被清掉的文档（删除同步）
     failed: int = 0          # 解析或写入失败
     chunks_written: int = 0
     truncated: int = 0       # 超过 embedding 模型 token 上限、被截尾的 chunk
     errors: list[str] = field(default_factory=list)
+
+
+class VectorCleanupError(RuntimeError):
+    """向量更新失败且旧版本无法恢复，必须停止当前批次。"""
 
 
 def run_ingest(
@@ -69,6 +77,11 @@ def run_ingest(
     limit: int | None = None,
 ) -> IngestStats:
     """带连接管理的 ingest 入口，CLI 和 API 都用这个。"""
+    # 增量 ingest 不能把新模型的向量混进旧索引；先检查，确保失败时 SQLite
+    # 和现有 Chroma 索引都不被触碰。空索引没有可比较的向量，允许首次入库。
+    if store.count() > 0:
+        _check_index_matches(embedding, store)
+
     conn = connect(settings.db_path_resolved)
     init_db(conn)
     try:
@@ -232,7 +245,13 @@ def ingest_vault(
         seen_paths.add(path.relative_to(settings.vault_path_resolved).as_posix())
         try:
             _ingest_one(settings, embedding, store, conn, path, stats, domain_mapping)
+        except VectorCleanupError:
+            conn.rollback()
+            raise
         except Exception as exc:
+            # 文档哈希和切块写入与向量写入属于同一个文件级流程。向量阶段失败时，
+            # 回滚本文件的 SQLite 变更，下一次扫描才能重新处理它。
+            conn.rollback()
             stats.failed += 1
             stats.errors.append(f"{path.as_posix()}: {exc}")
 
@@ -253,11 +272,14 @@ def _remove_deleted(store, conn, seen_paths, stats: IngestStats, full_scan: bool
         if file_path in seen_paths:
             continue
         try:
-            # 向量先清：这一步失败时 SQLite 完全没动，下次重跑能原样重试
-            store.delete_by_document(document_id)
-            if delete_document(conn, document_id):
+            removed = delete_document(conn, document_id, commit=False)
+            _commit_document_vectors(store, conn, document_id, [])
+            if removed:
                 stats.removed += 1
+        except VectorCleanupError:
+            raise
         except Exception as exc:
+            conn.rollback()
             stats.failed += 1
             stats.errors.append(f"{file_path}: {exc}")
 
@@ -273,9 +295,29 @@ def _ingest_one(
 ) -> None:
     """处理单个 Markdown 文件的完整入库流程。"""
     doc = parse_markdown(path, settings.vault_path_resolved)
-    document_id, changed, created = upsert_document(conn, doc, resolve_domain(doc.file_path, domain_mapping))
+    previous_metadata = get_document_metadata_by_path(conn, doc.file_path)
+    document_id, changed, created = upsert_document(
+        conn,
+        doc,
+        resolve_domain(doc.file_path, domain_mapping),
+        commit=False,
+    )
 
     if not changed:
+        # upsert_document 的 changed 只表示正文 hash；frontmatter 的 title/tags/source
+        # 改动仍需同步到 Chroma metadata，否则词面重排和引用展示会继续读旧值。
+        current_metadata = get_document_metadata_by_path(conn, doc.file_path)
+        if previous_metadata != current_metadata:
+            sync_derived_chunk_headings(
+                conn,
+                document_id,
+                doc.content,
+                doc.title,
+                commit=False,
+            )
+            rows = _build_vector_rows(conn, document_id)
+            _commit_document_metadata(store, conn, document_id, rows)
+            stats.metadata_updated += 1
         stats.unchanged += 1
         return
 
@@ -284,28 +326,91 @@ def _ingest_one(
         # 正文被清空、切不出任何块：上面的 upsert_document 已经把 SQLite 里的
         # 全文更新成空内容，但旧 chunk 和旧向量还挂着，照样能被检索命中——
         # 那才是真正的幽灵知识。所以这里必须把两边一起清掉。
-        store.delete_by_document(document_id)
-        replace_chunks(conn, document_id, [])
+        replace_chunks(conn, document_id, [], commit=False)
+        _commit_document_vectors(store, conn, document_id, [])
         if created:
             stats.added += 1
         else:
             stats.updated += 1
         return
 
-    replace_chunks(conn, document_id, chunks)
-    stats.chunks_written += len(chunks)
+    replace_chunks(conn, document_id, chunks, commit=False)
 
     rows = _build_vector_rows(conn, document_id)
-    stats.truncated += report_truncated(embedding, rows)
-    for row, vector in zip(rows, embed_documents(embedding, rows)):
+    truncated = report_truncated(embedding, rows)
+    vectors = embed_documents(embedding, rows)
+    for row, vector in zip(rows, vectors):
         row["embedding"] = vector
-    store.delete_by_document(document_id)
-    store.upsert_chunks(rows)
+    _commit_document_vectors(store, conn, document_id, rows)
 
+    stats.chunks_written += len(chunks)
+    stats.truncated += truncated
     if created:
         stats.added += 1
     else:
         stats.updated += 1
+
+
+def _commit_document_vectors(store, conn, document_id: int, rows: list[dict]) -> None:
+    # Chroma 与 SQLite 无共享事务；提交失败时恢复同一文档的旧向量。
+    previous = store.get_document_chunks(document_id)
+    try:
+        store.delete_by_document(document_id)
+        if rows:
+            store.upsert_chunks(rows)
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+            store.delete_by_document(document_id)
+            if previous:
+                store.upsert_chunks(previous)
+        except Exception as recovery_exc:
+            message = (
+                f"Vector update failed for document {document_id}: {exc}; "
+                f"recovery failed: {recovery_exc}. "
+                "请运行 `python ingest.py --rebuild-vectors` 重建向量库。"
+            )
+            try:
+                store.invalidate_index_info()
+            except OSError as info_exc:
+                raise VectorCleanupError(
+                    f"{message} 索引指纹撤销失败：{info_exc}"
+                ) from info_exc
+            raise VectorCleanupError(message) from recovery_exc
+        raise
+
+
+def _commit_document_metadata(store, conn, document_id: int, rows: list[dict]) -> None:
+    """提交正文不变的 metadata 更新，并在任一步失败时恢复两边旧值。
+
+    这条路径故意只调用 Chroma ``update``，不调用 embedding，也不删写向量。
+    SQLite 与 Chroma 没有共享事务，所以先保存旧 metadata；SQLite commit 失败
+    或 Chroma 部分更新失败时，回滚 SQLite 并用快照恢复 Chroma。
+    """
+    previous = store.get_document_chunks(document_id)
+    try:
+        store.update_chunk_metadata(rows)
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+            if previous:
+                store.update_chunk_metadata(previous)
+        except Exception as recovery_exc:
+            message = (
+                f"Metadata update failed for document {document_id}: {exc}; "
+                f"recovery failed: {recovery_exc}. "
+                "请运行 `python ingest.py --rebuild-vectors` 重建向量库。"
+            )
+            try:
+                store.invalidate_index_info()
+            except OSError as info_exc:
+                raise VectorCleanupError(
+                    f"{message} 索引指纹撤销失败：{info_exc}"
+                ) from info_exc
+            raise VectorCleanupError(message) from recovery_exc
+        raise
 
 
 def _build_vector_rows(conn, document_id: int) -> list[dict]:
@@ -344,7 +449,12 @@ def embed_documents(embedding: BaseEmbedding, rows: list[dict]) -> list[list[flo
     控制的是显存上限。在这一层再切一遍是重复逻辑，而且省不了内存——
     返回的向量条数不管怎么切都一样多。
     """
-    return embedding.embed([row["content"] for row in rows])
+    vectors = embedding.embed([row["content"] for row in rows])
+    if len(vectors) != len(rows):
+        raise ValueError(
+            f"Embedding returned {len(vectors)} vectors for {len(rows)} chunks"
+        )
+    return vectors
 
 
 def report_truncated(embedding: BaseEmbedding, rows: list[dict]) -> int:

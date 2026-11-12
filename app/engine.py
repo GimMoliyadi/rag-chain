@@ -42,8 +42,15 @@ def build_engine(
     embedding = embedding or get_embedding_client(settings)
     store = store or ChromaStore(settings.chroma_path_resolved)
     llm = llm or get_llm_client(settings)
+    reranker = build_reranker(settings)
 
-    retriever = Retriever(embedding=embedding, store=store, default_top_k=settings.top_k)
+    retriever = Retriever(
+        embedding=embedding, store=store, default_top_k=settings.top_k,
+        diversity_enabled=settings.diversity_enabled,
+        max_chunks_per_document=settings.max_chunks_per_document,
+        reranker=reranker,
+        reranker_candidate_top_k=settings.reranker_candidate_top_k,
+    )
 
     # Router 始终注入：规则术语表路由本身零成本，没有开关。
     router, allowed_domains = load_router(settings.knowledge_domains_path_resolved)
@@ -53,7 +60,11 @@ def build_engine(
     # 关闭时与历史版本完全一致。
     evidence_gate = None
     if settings.evidence_gate_enabled:
-        evidence_gate = EvidenceGate(llm, chunk_chars=settings.evidence_judge_chunk_chars)
+        evidence_gate = EvidenceGate(
+            llm,
+            chunk_chars=settings.evidence_judge_chunk_chars,
+            fail_closed=settings.strict_evidence_enabled,
+        )
 
     # Rescue 用独立的 Retriever：主检索器可能开着 diversity 的「每文档最多
     # N chunk」限额，而救援候选池必须不带这个限额，否则「答案在同文档第 3 个
@@ -62,6 +73,8 @@ def build_engine(
     if settings.evidence_gate_enabled and settings.evidence_rescue_enabled:
         rescue_retriever = Retriever(
             embedding=embedding, store=store, default_top_k=settings.evidence_rescue_k,
+            reranker=reranker,
+            reranker_candidate_top_k=settings.reranker_candidate_top_k,
         )
 
     # Personal Context 每次 advisor 请求全量读取一次：文件小，而且它是「当前
@@ -82,8 +95,6 @@ def build_engine(
         vault_name=settings.vault_name,
         context_filter_enabled=settings.context_filter_enabled,
         filter_retrieve_top_k=settings.filter_retrieve_top_k,
-        reranker=build_reranker(settings),
-        reranker_candidate_top_k=settings.reranker_candidate_top_k,
         router=router,
         router_domains=allowed_domains,
         llm_router_fallback_enabled=settings.llm_router_fallback_enabled,
@@ -92,6 +103,7 @@ def build_engine(
         evidence_rescue_k=settings.evidence_rescue_k,
         rescue_retriever=rescue_retriever,
         personal_context_loader=personal_context_loader,
+        strict_evidence=settings.strict_evidence_enabled,
     )
     return engine, store
 
@@ -109,6 +121,7 @@ def build_reranker(settings: Settings) -> CrossEncoderReranker | None:
         device=settings.reranker_device,
         dtype=settings.reranker_dtype,
         batch_size=settings.reranker_batch_size,
+        include_metadata=True,
     )
     seconds = reranker.preload()
     print(f"Reranker loaded: {settings.reranker_model} in {seconds:.1f}s")

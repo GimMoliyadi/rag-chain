@@ -5,15 +5,24 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .embedding import BaseEmbedding
 from .vectorstore import ChromaStore
 
+if TYPE_CHECKING:
+    from .reranker import CrossEncoderReranker, RerankStats
+
 
 @dataclass
 class SearchResult:
-    """一条检索命中。score 是相似度，0~1，越大越相关。"""
+    """一条检索命中。score 是原始向量余弦相似度，范围 0~1。
+
+    返回顺序由向量相似度与标题/章节词面信号的内部混合排序决定，
+    但不把内部排名分数写进这个既有字段，避免调用方误把它当成余弦值。
+    """
 
     score: float
     chunk_id: int
@@ -26,6 +35,7 @@ class SearchResult:
     content: str
     domain: str = ""         # 知识域（阶段二 metadata 回填之前是空串）
     source_type: str = ""
+    rerank_score: float | None = None  # 问答来源保留既有精排分数口径；search.score 不变
 
 
 class EmbeddingMismatchError(RuntimeError):
@@ -36,10 +46,20 @@ class EmbeddingMismatchError(RuntimeError):
     """
 
 
+# 混合检索先取一批候选，再按向量相似度和标题/章节词面重排。
+# 50 覆盖真实索引中已经观察到的「精确章节排在向量 Top-20 之外」的情况，
+# 仍远小于全库 14k chunk，不把每次查询变成全库扫描。
+HYBRID_CANDIDATE_K = 50
 # 多样性开启时先取多少条候选。候选池太小，文档限额会把结果压到不足 Top-K；
 # 20 是"每篇最多 2 条时，Top-5 还有 4 倍冗余"的量级，不是精调值。
 DIVERSITY_CANDIDATE_K = 20
 
+# 词面信号不是第二个向量空间；但问题完整点名的标题/章节是比粗排余弦更强
+# 的定位证据。略高于半权重，足以让「Shor 算法 / 实验进展」超过同文档的定义章节；
+# 混合结果最终取 max(vector, blend)，词面信号不会把向量命中降权。
+LEXICAL_BOOST_WEIGHT = 0.6
+
+_NON_WORD = re.compile(r"[^\w\u3400-\u9fff]+", re.UNICODE)
 
 class Retriever:
     """用 embedding + 向量库做相似度检索。"""
@@ -51,24 +71,35 @@ class Retriever:
         default_top_k: int = 5,
         diversity_enabled: bool = False,
         max_chunks_per_document: int = 2,
+        reranker: CrossEncoderReranker | None = None,
+        reranker_candidate_top_k: int = 50,
     ):
         self._embedding = embedding
         self._store = store
         self._default_top_k = default_top_k
         self._diversity_enabled = diversity_enabled
         self._max_chunks_per_document = max_chunks_per_document
+        self._reranker = reranker
+        self._reranker_candidate_top_k = reranker_candidate_top_k
         # 最近一次 search 的调试信息。search 的返回值必须保持 list[SearchResult]
         # 不变（eval / API / 测试都依赖它），domain_empty_fallback 这类过程信息
         # 只能挂在旁边，不能改返回类型。
         self.last_debug: dict = {}
 
+    @property
+    def rerank_stats(self) -> RerankStats | None:
+        return self._reranker.stats if self._reranker is not None else None
+
     def search(self, question: str, top_k: int | None = None, domains: list[str] | None = None) -> list[SearchResult]:
-        """检索与 question 最相似的 top_k 条 chunk，按相似度从高到低排列。
+        """检索与 question 最相关的 top_k 条 chunk，按混合相关性从高到低排列。
 
         domains=None 或 [] 时是全库检索，行为与历史版本完全一致（回归基线）；
         domains=[...] 时用 Chroma 的 metadata 过滤只在指定知识域里找。
         指定的域在库里一条 chunk 都没有时（如 fiction），不做空返回，
         回退全库检索，并记录 domain_empty_fallback=True。
+
+        返回对象的 ``score`` 始终是原始向量余弦相似度；它不一定随返回顺序单调，
+        因为标题/章节词面信号只参与内部排序。
         """
         k = top_k or self._default_top_k
         count = self._store.count()
@@ -82,7 +113,13 @@ class Retriever:
 
         scoped = bool(domains)
         where = {"domain": {"$in": list(domains)}} if scoped else None
-        candidate_k = DIVERSITY_CANDIDATE_K if self._diversity_enabled else k
+        # 词面重排必须看到向量粗排前 50 条，否则精确章节已经被 Chroma 截掉
+        # 就没有机会回来。多取候选只影响一次 Chroma query，不改变返回条数。
+        candidate_k = max(k, HYBRID_CANDIDATE_K)
+        if self._reranker is not None:
+            candidate_k = max(candidate_k, self._reranker_candidate_top_k)
+        if self._diversity_enabled:
+            candidate_k = max(candidate_k, DIVERSITY_CANDIDATE_K)
         question_vector = self._embedding.embed_query(question)
         rows = self._store.query(question_vector, n_results=min(candidate_k, count), where=where)
 
@@ -92,9 +129,49 @@ class Retriever:
             # 过滤本身没错，错的是"拿一个空结果当答案"，所以退回全库。
             fallback = True
             rows = self._store.query(question_vector, n_results=min(candidate_k, count))
+            where = None
 
+        expanded_documents = []
+        if self._reranker is not None:
+            # 已观察到：问题点名 Shor 算法时定义在 Top-1，但实验节在
+            # 全库 Top-50 以外。只重排全库候选救不回来；补查点名文档。
+            normalized = _normalize_for_match(question)
+            matches: dict[int, float] = {}
+            for row in rows:
+                match = _document_match_score(normalized, row)
+                if match:
+                    doc_id = int(row["document_id"])
+                    matches[doc_id] = max(matches.get(doc_id, 0.0), match)
+            expanded_documents = sorted(matches, key=matches.get, reverse=True)[:3]
+            by_id = {int(row["chunk_id"]): row for row in rows}
+            for doc_id in expanded_documents:
+                doc_where = {"document_id": doc_id}
+                if where:
+                    doc_where = {"$and": [where, doc_where]}
+                for row in self._store.query(question_vector, n_results=min(candidate_k, count), where=doc_where):
+                    by_id.setdefault(int(row["chunk_id"]), row)
+            rows = list(by_id.values())
+
+        candidates = len(rows)
+        # 先用精确标题/章节信号把候选排好，再做同文档限额。若先限额，
+        # 长文档的前两个向量命中可能把真正被问题点名的章节直接丢掉。
+        rows = _hybrid_rank(question, rows)
+        rerank_fallback = False
+        if self._reranker is not None:
+            before = self._reranker.stats.fallback
+            ranked = self._reranker.rerank(question, [_to_hit(row) for row in rows])
+            rerank_fallback = self._reranker.stats.fallback > before
+            # CrossEncoderReranker 的 score 是精排分数（供旧 eval 使用）。
+            # 公共检索接口只采用其顺序，仍从原始 distance 返回余弦值。
+            by_id = {int(row["chunk_id"]): row for row in rows}
+            if not rerank_fallback:
+                for hit in ranked:
+                    by_id[hit.chunk_id]["_rerank_score"] = hit.score
+            rows = [by_id[hit.chunk_id] for hit in ranked]
         if self._diversity_enabled:
             rows = _cap_per_document(rows, k, self._max_chunks_per_document)
+        else:
+            rows = rows[:k]
 
         hits = [_to_hit(row) for row in rows]
         self.last_debug = {
@@ -102,8 +179,11 @@ class Retriever:
             "domains": list(domains) if domains else [],
             "domain_empty_fallback": fallback,
             "diversity_applied": self._diversity_enabled,
-            "candidates": len(rows),
+            "candidates": candidates,
             "returned": len(hits),
+            "reranker_applied": self._reranker is not None and not rerank_fallback,
+            "reranker_fallback": rerank_fallback,
+            "expanded_documents": expanded_documents,
         }
         return hits
 
@@ -131,6 +211,8 @@ def _cap_per_document(rows: list[dict], top_k: int, max_per_document: int) -> li
 
 def _to_hit(row: dict) -> SearchResult:
     return SearchResult(
+        # _rank_score 只用于候选排序；SearchResult.score 的既有契约是
+        # 原始向量余弦相似度，直接检索的 MCP/CLI/API 都会把它展示给调用方。
         score=_to_similarity(row["distance"]),
         chunk_id=int(row["chunk_id"]),
         document_id=int(row["document_id"]),
@@ -142,7 +224,121 @@ def _to_hit(row: dict) -> SearchResult:
         content=row["content"],
         domain=str(row.get("domain", "")),
         source_type=str(row.get("source_type", "")),
+        rerank_score=row.get("_rerank_score"),
     )
+
+
+def _hybrid_rank(question: str, rows: list[dict]) -> list[dict]:
+    """用标题/章节的精确词面信号修正向量粗排。
+
+    向量检索擅长找同义表达，但对「问题明确点名某篇文档的某一节」并不
+    可靠：同一篇文档的定义、参考资料等章节可能占据前几名，真正的目标
+    章节反而落到 Top-20 之外。这里不做全库关键词搜索，只在已取出的
+    候选里计算一个保守的 metadata 信号：只有一个完整的标题或章节短语
+    出现在问题中才算命中。不能把「问题和标题共享三个常见字」当成证据，
+    否则长问题会把一批不相干的标题错误地抬高。
+
+    无词面信号的候选保持原始向量分数；有信号时用略高于半权重的内部混合分数。
+    该分数只存在于候选行的 ``_rank_score``，不会改写 SearchResult.score。
+    """
+    if not rows:
+        return rows
+    normalized_question = _normalize_for_match(question)
+    if not normalized_question:
+        for row in rows:
+            row.pop("_rank_score", None)
+        return rows
+
+    candidates: list[tuple[float, float, int, dict]] = []
+    for position, row in enumerate(rows):
+        vector_score = _to_similarity(row["distance"])
+        title_score = _document_match_score(normalized_question, row)
+        heading_score = _field_match_score(normalized_question, row.get("heading", ""))
+        # 路径通常包含知识域、编号和通用目录词；它不是用户可见的文档
+        # 标题，不能用最长公共子串参与排序，否则会制造大量假命中。
+        # 标题缺失时，完整文件名仍可作为弱补充，但只匹配 basename。
+        # 标题本身就是定位信号，不能因为章节为空而再乘一次 0.7；
+        # 标题和章节都命中时再叠加一点具体度，最多封顶 1。
+        lexical_score = max(
+            title_score,
+            heading_score,
+            min(1.0, title_score + 0.3 * heading_score),
+        )
+        candidates.append((vector_score, lexical_score, position, row))
+
+    # 一个文档通常被切成多个 chunk，标题会在每个 chunk 的 metadata 中重复。
+    # 词面命中只给该文档最有说服力的一条 chunk 加权，其余 chunk 保留向量分数，
+    # 避免一个精确标题把 Top-K 全部占满，导致同一问题点名的另一篇文档消失。
+    best_lexical: dict[int, tuple[float, float, int]] = {}
+    for vector_score, lexical_score, position, row in candidates:
+        if lexical_score <= 0:
+            continue
+        document_id = int(row["document_id"])
+        previous = best_lexical.get(document_id)
+        current = (lexical_score, vector_score, -position)
+        if previous is None or current > previous:
+            best_lexical[document_id] = current
+
+    ranked: list[tuple[float, int, dict]] = []
+    for vector_score, lexical_score, position, row in candidates:
+        rank_score = vector_score
+        document_id = int(row["document_id"])
+        selected = best_lexical.get(document_id)
+        if lexical_score > 0 and selected == (lexical_score, vector_score, -position):
+            blended_score = (
+                (1.0 - LEXICAL_BOOST_WEIGHT) * vector_score
+                + LEXICAL_BOOST_WEIGHT * lexical_score
+            )
+            # 词面信号是 boost，不是惩罚项。短标题的精确命中分数可能
+            # 低于很高的向量分数；这种情况下必须保留原始向量排序位置。
+            rank_score = max(vector_score, blended_score)
+        row["_rank_score"] = rank_score
+        ranked.append((rank_score, position, row))
+
+    ranked.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    return [row for _, _, row in ranked]
+
+
+def _normalize_for_match(value: object) -> str:
+    """折叠大小写、空白和标点，保留中英文和数字供精确匹配。"""
+    return _NON_WORD.sub("", str(value).lower())
+
+
+def _document_match_score(question: str, row: dict) -> float:
+    title_score = _field_match_score(question, row.get("title", ""))
+    if title_score:
+        return title_score
+    file_name = str(row.get("file_path", "")).replace("\\", "/").rsplit("/", 1)[-1]
+    return _field_match_score(question, file_name.removesuffix(".md"))
+
+
+def _field_match_score(question: str, field: object) -> float:
+    """返回完整字段短语在问题中的精确匹配强度。
+
+    只接受完整字段命中，不接受最长公共子串：问题越长，随机共享几个字的
+    机会越大，模糊的局部匹配反而会把错误文档排到前面。中文至少三个字符；
+    两字标题/章节必须整段命中，ASCII 实体（Shor、MVP）至少两个字符。
+    完整命中仍按短语长度给一点区分度：较长、较具体的标题比其中包含的
+    短标题更有定位价值。
+    """
+    raw_field = str(field)
+    variants = [_normalize_for_match(raw_field)]
+    # 标题常把中文名和英文释名放在括号里。问题只写中文名时，
+    # 括号里的译名不应阻断完整中文标题的匹配。
+    without_parenthetical = re.sub(r"\([^)]*\)|（[^）]*）", "", raw_field)
+    variants.append(_normalize_for_match(without_parenthetical))
+
+    best = 0.0
+    for normalized_field in variants:
+        if len(normalized_field) < 2:
+            continue
+        minimum = 3 if any("\u3400" <= char <= "\u9fff" for char in normalized_field) else 2
+        if len(normalized_field) < minimum or normalized_field not in question:
+            continue
+        # 0.5 是完整命中的最低信号，最多随短语长度升到 1.0；
+        # 不让一个两字章节压过更具体的长标题，但也不抹掉短标题的价值。
+        best = max(best, 0.5 + 0.5 * min(1.0, len(normalized_field) / 8.0))
+    return best
 
 
 def _to_similarity(distance: float) -> float:

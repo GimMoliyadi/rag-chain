@@ -62,6 +62,32 @@ def test_changed_document_is_updated_in_place(conn, fake_vault):
     assert get_document(conn, doc_id)["content_hash"] != content_hash(_doc(fake_vault).content)
 
 
+def test_metadata_only_change_updates_existing_row_without_content_change(conn, fake_vault):
+    """frontmatter 改动也要同步 SQLite，但不应被当成正文更新。"""
+    doc = _doc(fake_vault)
+    doc_id, _, _ = upsert_document(conn, doc)
+    original_content = doc.content
+    original_hash = content_hash(original_content)
+
+    doc.title = "合同违约：精准检索标题"
+    doc.tags = ["法律", "精准标签"]
+    doc.source = "更新后的民法典笔记"
+    doc.created_at = "2026-02-03"
+    doc.updated_at = "2026-02-04 05:06:07"
+
+    new_id, changed, created = upsert_document(conn, doc)
+
+    assert (new_id, changed, created) == (doc_id, False, False)
+    got = get_document(conn, doc_id)
+    assert got["content"] == original_content
+    assert got["content_hash"] == original_hash
+    assert got["title"] == "合同违约：精准检索标题"
+    assert got["tags"] == ["法律", "精准标签"]
+    assert got["source"] == "更新后的民法典笔记"
+    assert got["created_at"] == "2026-02-03"
+    assert got["updated_at"] == "2026-02-04 05:06:07"
+
+
 def test_unique_file_path_rejects_duplicates(conn, fake_vault):
     doc = _doc(fake_vault)
     upsert_document(conn, doc)

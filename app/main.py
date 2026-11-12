@@ -26,7 +26,7 @@ from .embedding import BaseEmbedding, get_embedding_client
 from .engine import build_engine
 from .ingest import IngestStats, run_ingest
 from .llm import BaseLLM, get_llm_client
-from .rag import MODE_NORMAL, source_to_dict
+from .rag import ANSWER_VERIFICATION_UNAVAILABLE_ANSWER, MODE_NORMAL, source_to_dict
 from .retriever import EmbeddingMismatchError
 from .vectorstore import ChromaStore
 
@@ -47,14 +47,19 @@ def create_app(
 
     # RAG 链路的组装统一在 app.engine（ask.py 和 mcp_server.py 共用同一份）。
     # 这里只额外开 SQLite 连接：HTTP 层要查文档列表和分页，SQLite 不参与检索。
+    owns_store = store is None
     engine, store = build_engine(settings, embedding=embedding, store=store, llm=llm)
     conn = connect(settings.db_path_resolved)
     init_db(conn)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        yield
-        conn.close()
+        try:
+            yield
+        finally:
+            conn.close()
+            if owns_store:
+                store.close()
 
     app = FastAPI(
         title="Obsidian RAG Backend",
@@ -138,12 +143,19 @@ def _register_routes(app: FastAPI) -> None:
         """完整 RAG 问答：路由 + 检索 +（证据评审）+（证据救援）+ 生成 + 引用来源。非流式。
 
         响应在历史字段（answer/used_chunks/sources）之外新增 route / evidence /
-        timings / mode / personal_context 五个可选字段，全部为 None 或空 dict 时
+        timings / mode / personal_context / citation_check / answer_verification
+        可选字段，全部为 None 或空 dict 时
         说明 Advisor 层没启用——老客户端只读老字段就不受任何影响。
         """
         result = app.state.rag.answer(request.question, top_k=request.top_k, mode=request.mode)
+        verification_failed = (
+            result.answer_verification is not None
+            and not result.answer_verification.passed
+        )
         return {
-            "answer": result.answer,
+            # RAGEngine 的严格拒答路径已经返回固定文案；这里再做一次出口
+            # 门控，避免自定义 engine/装配替身把未核验原回答塞进 HTTP。
+            "answer": ANSWER_VERIFICATION_UNAVAILABLE_ANSWER if verification_failed else result.answer,
             "used_chunks": result.used_chunks,
             "sources": [source_to_dict(s) for s in result.sources],
             "route": asdict(result.route) if result.route else None,
@@ -151,6 +163,13 @@ def _register_routes(app: FastAPI) -> None:
             "timings": result.timings,
             "mode": result.mode,
             "personal_context": result.personal_context,
+            "citation_check": result.citation_check,
+            # AnswerVerification.to_dict() 只返回状态/数量/错误标志，不回显
+            # 被拦截答案中的 claims 或 unsupported_claims。
+            "answer_verification": (
+                result.answer_verification.to_dict()
+                if result.answer_verification else None
+            ),
         }
 
     @app.post("/api/chat/stream")
@@ -221,16 +240,8 @@ def _doc_count(app: FastAPI) -> int:
 
 
 def _stats_payload(stats: IngestStats) -> dict:
-    """把 IngestStats 转成 API 响应格式。"""
-    return {
-        "scanned": stats.scanned,
-        "added": stats.added,
-        "updated": stats.updated,
-        "unchanged": stats.unchanged,
-        "failed": stats.failed,
-        "chunks_written": stats.chunks_written,
-        "errors": stats.errors,
-    }
+    """把 IngestStats 转成 API 响应格式（包含 metadata_updated）。"""
+    return asdict(stats)
 
 
 # 注意：这里故意不放 `app = create_app()`。

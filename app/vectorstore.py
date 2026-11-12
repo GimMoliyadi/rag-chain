@@ -24,7 +24,6 @@ COLLECTION_NAME = "obsidian_chunks"
 # 指纹文件名：记录"建这个向量库时用的是哪个 embedding 模型"
 INDEX_INFO_FILENAME = "embedding_index.json"
 
-
 class ChromaStore:
     """本地持久化的 ChromaDB 封装。"""
 
@@ -51,6 +50,10 @@ class ChromaStore:
         self._info_path.write_text(
             json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+    def invalidate_index_info(self) -> None:
+        """写入失败且无法清理时，阻止半成品索引继续用于检索。"""
+        self._info_path.unlink(missing_ok=True)
 
     def clear(self) -> None:
         """删掉整个 collection 并重建一个空的。
@@ -94,6 +97,22 @@ class ChromaStore:
             documents=[r["content"] for r in rows],
             metadatas=[_metadata(r) for r in rows],
         )
+
+    def get_document_chunks(self, document_id: int) -> list[dict]:
+        """读取文档的现有向量和元数据，供文件级写入失败时恢复。"""
+        result = self._col.get(
+            where={"document_id": document_id},
+            include=["documents", "metadatas", "embeddings"],
+        )
+        return [
+            {
+                **(result["metadatas"][i] or {}),
+                "chunk_id": int(chunk_id),
+                "content": result["documents"][i],
+                "embedding": result["embeddings"][i].tolist(),
+            }
+            for i, chunk_id in enumerate(result["ids"])
+        ]
 
     def query(self, embedding: list[float], n_results: int = 5, where: dict | None = None) -> list[dict]:
         """按向量找最近的 n_results 条，返回 [{content, distance, **metadata}]。
@@ -143,7 +162,24 @@ class ChromaStore:
         SQLite 有、Chroma 没有的 chunk 在这里跳过——补齐它属于 ingest/重建的职责，
         元数据回填不顺便造向量。
         """
-        got = self._col.get(include=["metadatas"])
+        return self.update_chunk_metadata(rows)
+
+    def update_chunk_metadata(self, rows: list[dict]) -> int:
+        """只更新已有 chunk 的 metadata，不触碰 embedding 或正文。
+
+        ``rows`` 可以来自 SQLite 的切块行，也可以来自
+        :meth:`get_document_chunks` 的恢复快照。Chroma 的 ``update`` 是按完整
+        metadata 写入，因此这里始终生成全字段 metadata，避免保留旧的 title、
+        tags 或 source。SQLite 有而 Chroma 没有的 chunk 会跳过；增量 ingest
+        的职责是同步已有向量，缺失向量仍由正文变更或重建流程处理。
+        """
+        if not rows:
+            return 0
+
+        # ids 过滤能避免 metadata-only 更新反复扫描全库；旧 Chroma 版本若
+        # 返回缺失 id，下面仍按 refresh_domain_metadata 的安全策略跳过它。
+        ids = [str(row["chunk_id"]) for row in rows]
+        got = self._col.get(ids=ids, include=["metadatas"])
         current = dict(zip(got["ids"], got["metadatas"]))
         changed_ids: list[str] = []
         changed_metas: list[dict] = []

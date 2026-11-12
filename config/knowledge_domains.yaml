@@ -97,6 +97,8 @@ router_terms:
     - 贝叶斯均衡
     - 讨价还价
     - 演化稳定
+    - Cournot
+    - 古诺
   han_li_framework:
     - 韩立
     - 韩老魔
@@ -118,6 +120,7 @@ router_terms:
     - 势阱
     - 谐振子
     - 哈密顿
+    - POVM
   food_label:
     - 配料表
     - 营养标签
@@ -182,4 +185,3 @@ router_terms:
     - 股票
     - 资产配置
     - 复利
-

@@ -1,6 +1,8 @@
 """测试六、七：/health 与 /api/search 正常，顺带验证 /api/chat 的引用编号。"""
 from __future__ import annotations
 
+import json
+
 
 def test_health_ok(client):
     r = client.get("/health")
@@ -67,6 +69,35 @@ def test_api_chat_returns_answer_and_citations(client):
         assert s["title"] and s["file_path"].endswith(".md")
         assert s["chunk"].strip()
         assert 0.0 <= s["score"] <= 1.0
+
+
+def test_api_chat_exposes_safe_final_verification_status_without_claim_text(client):
+    from app.evidence import ANSWER_STATUS_UNSUPPORTED, AnswerVerification
+    from app.rag import RAGAnswer
+
+    secret_claim = "不应从 HTTP 响应泄漏的未核验事实"
+    verification = AnswerVerification(
+        status=ANSWER_STATUS_UNSUPPORTED,
+        reason=f"不支持：{secret_claim}",
+        claims=[{"claim": secret_claim, "supported": False}],
+        unsupported_claims=[secret_claim],
+    )
+    client.app.state.rag.answer = lambda *args, **kwargs: RAGAnswer(
+        answer=secret_claim,
+        answer_verification=verification,
+    )
+
+    response = client.post("/api/chat", json={"question": "问题"})
+    body = response.json()
+    public = body["answer_verification"]
+
+    assert response.status_code == 200
+    assert public["status"] == ANSWER_STATUS_UNSUPPORTED
+    assert "claims" not in public
+    assert "unsupported_claims" not in public
+    assert secret_claim not in json.dumps(body, ensure_ascii=False)
+    assert public["unsupported_claim_count"] == 1
+    assert public["sources_usable"] is False
 
 
 def test_api_chat_rejects_empty_question(client):
@@ -141,7 +172,53 @@ def test_api_ingest_reports_stats(client, settings):
     assert r.status_code == 200
     body = r.json()
     assert body["unchanged"] == 2  # fixture 已经导过一次，再次触发应全部跳过
+    assert body["metadata_updated"] == 0
     assert body["failed"] == 0
+
+
+def test_api_ingest_reports_removed_documents(client, fake_vault):
+    (fake_vault / "创业" / "MVP.md").unlink()
+
+    response = client.post("/api/ingest", json={})
+
+    assert response.status_code == 200
+    assert response.json()["removed"] == 1
+    assert response.json()["truncated"] == 0
+    assert client.get("/health").json()["documents"] == 1
+
+
+def test_api_closes_owned_vector_store(settings, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+
+    app = create_app(settings=settings)
+    closed = []
+    original_close = app.state.store.close
+
+    def record_close():
+        closed.append(True)
+        original_close()
+
+    monkeypatch.setattr(app.state.store, "close", record_close)
+    try:
+        with TestClient(app) as c:
+            assert c.get("/health").status_code == 200
+        assert closed == [True]
+    finally:
+        if not closed:
+            original_close()
+
+
+def test_api_keeps_injected_vector_store_open(settings, ingested):
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    from app.retriever import Retriever
+
+    store, embedding, _ = ingested
+    with TestClient(create_app(settings=settings, store=store, embedding=embedding)) as c:
+        assert c.get("/health").status_code == 200
+
+    assert Retriever(embedding, store).search("最小可行产品")
 
 
 def test_api_ingest_fails_cleanly_when_vault_missing(tmp_path):

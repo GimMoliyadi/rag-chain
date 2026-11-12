@@ -66,12 +66,14 @@ class CrossEncoderReranker:
         model=None,
         batch_size: int = RERANK_BATCH_SIZE,
         max_length: int = MAX_RERANK_SEQ_LENGTH,
+        include_metadata: bool = False,
     ):
         self._model_name = model_name
         self._device = device
         self._dtype = dtype
         self._batch_size = batch_size
         self._max_length = max_length
+        self._include_metadata = include_metadata
         self._model = model
         self._stats = RerankStats()
 
@@ -125,7 +127,14 @@ class CrossEncoderReranker:
         """把候选送进 cross-encoder，返回和 hits 一一对应的分数。"""
         if self._model is None:
             self.preload()
-        pairs = [(question, hit.content) for hit in hits]
+        # 短章节可能只写“2019：分解 35”，正文没有文档主题。实际检索
+        # 把标题/章节一起交给精排，避免把它误判成与 Shor 算法无关。
+        # 默认关闭以保留旧评估调用的正文-only 口径；不改动返回原文。
+        pairs = [
+            (question, f"文档：{hit.title}\n章节：{hit.heading}\n\n{hit.content}"
+             if self._include_metadata else hit.content)
+            for hit in hits
+        ]
         raw = self._model.predict(
             pairs,
             batch_size=self._batch_size,

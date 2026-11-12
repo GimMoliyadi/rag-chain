@@ -195,7 +195,7 @@ def test_links_only_inside_code_fence_do_not_trigger() -> None:
 # ---------------------------------------------------------------------------
 
 def test_prepare_context_drops_navigation_and_refills() -> None:
-    """导航 chunk 被跳过，后面相似度低一点的真内容补上来。"""
+    """导航 chunk 被跳过，后面相关性靠后的真内容补上来。"""
     hits = [
         _hit(1, NAVIGATION_CHUNK, score=0.90),
         _hit(2, "第一条真实内容：Kakutani 不动点定理给出存在性。", score=0.85),

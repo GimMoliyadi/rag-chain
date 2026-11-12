@@ -6,6 +6,87 @@ from app.retriever import Retriever, SearchResult
 from app.vectorstore import ChromaStore
 
 
+class _CandidateStore:
+    """只返回向量粗排候选的假 store，用来验证混合排序的候选余量。"""
+
+    def __init__(self, rows: list[dict]):
+        self.rows = rows
+        self.requested: list[int] = []
+
+    def count(self) -> int:
+        return len(self.rows)
+
+    def read_index_info(self) -> dict:
+        return {"model": "hashing-32d", "dimensions": 32}
+
+    def query(self, embedding, n_results: int = 5, where=None) -> list[dict]:
+        self.requested.append(n_results)
+        return self.rows[:n_results]
+
+
+class _ScopedCandidateStore(_CandidateStore):
+    def query(self, embedding, n_results=5, where=None):
+        self.requested.append(where)
+        def matches(row, condition):
+            if not condition:
+                return True
+            if "$and" in condition:
+                return all(matches(row, part) for part in condition["$and"])
+            key, value = next(iter(condition.items()))
+            return row.get(key) in value["$in"] if isinstance(value, dict) else row.get(key) == value
+        return [row for row in self.rows if matches(row, where)][:n_results]
+
+
+def test_reranker_recovers_named_document_section_beyond_global_pool():
+    from app.embedding import HashingEmbedding
+    from app.reranker import CrossEncoderReranker
+
+    rows = [dict(chunk_id=i, document_id=i, chunk_index=0, content="定义", distance=0.3,
+                 title=f"其他文档{i}", file_path=f"other/{i}.md", heading="定义", domain="quantum")
+            for i in range(1, 52)]
+    rows[0].update(title="Shor 算法", file_path="shor.md")
+    rows[-1].update(document_id=1, title="Shor 算法", file_path="shor.md", content="实验：35", distance=0.6)
+    # Same title in another domain must never be pulled across the scope.
+    rows.append(dict(rows[-1], chunk_id=52, domain="unrelated", content="实验：99"))
+    class Model:
+        def predict(self, pairs, **kwargs):
+            return [99.0 if "实验" in text else -3.0 for _, text in pairs]
+    reranker = CrossEncoderReranker(model=Model(), include_metadata=True)
+    store = _ScopedCandidateStore(rows)
+    retriever = Retriever(HashingEmbedding(32), store, reranker=reranker,
+                          diversity_enabled=True, max_chunks_per_document=1)
+
+    hits = retriever.search("Shor 算法有哪些实际实验成果？", top_k=5, domains=["quantum"])
+
+    assert hits[0].chunk_id == 51
+    assert hits[0].score == 0.4  # not the reranker score of 99
+    assert hits[0].rerank_score == 99.0
+    assert 52 not in [h.chunk_id for h in hits]
+    assert len(hits) == 5
+    assert len({h.document_id for h in hits}) == 5
+    assert retriever.last_debug["candidates"] == 51
+    assert retriever.last_debug["reranker_applied"] is True
+    assert store.requested[1] == {"$and": [{"domain": {"$in": ["quantum"]}}, {"document_id": 1}]}
+
+
+def test_reranker_failure_reports_fallback_and_keeps_cosine():
+    from app.embedding import HashingEmbedding
+    from app.reranker import CrossEncoderReranker
+    class Model:
+        def predict(self, *args, **kwargs):
+            raise RuntimeError("test failure")
+    rows = [dict(chunk_id=1, document_id=1, chunk_index=0, content="正文", distance=0.2,
+                 title="某文档", file_path="a.md", heading="正文")]
+    retriever = Retriever(HashingEmbedding(32), _CandidateStore(rows),
+                          reranker=CrossEncoderReranker(model=Model()))
+
+    hits = retriever.search("未点名的检索")
+
+    assert hits[0].score == 0.8
+    assert retriever.last_debug["reranker_fallback"] is True
+    assert retriever.last_debug["reranker_applied"] is False
+
+
 def test_ingest_stats_look_right(ingested, settings):
     store, _, stats = ingested
     assert stats.scanned == 2
@@ -67,9 +148,8 @@ def test_search_returns_relevant_chunks(ingested, settings):
         assert h.document_id > 0
         assert h.title and h.file_path
         assert h.content.strip()
-    # 相似度必须从高到低排序
-    assert all(hits[i].score >= hits[i + 1].score for i in range(len(hits) - 1))
-    # 最好的结果应该真的讲到 MVP
+    # 返回顺序由 Retriever 的混合相关性决定，不要求原始向量相似度单调；
+    # 最好的结果应该真的讲到 MVP。
     assert "最小可行产品" in hits[0].content
 
 
@@ -97,3 +177,120 @@ def test_search_on_empty_store_returns_nothing(tmp_path):
     store = ChromaStore(tmp_path / "empty_chroma")
     retriever = Retriever(embedding=HashingEmbedding(32), store=store, default_top_k=5)
     assert retriever.search("任何东西") == []
+
+
+def test_hybrid_search_expands_candidates_and_promotes_exact_section():
+    """标题/章节明确点名时，不能被向量 Top-5 的同文档章节压住。
+
+    目标章节故意放在向量粗排第 18 条；只有候选池先扩大到 50，
+    再用 metadata 词面信号重排，才能把它送进最终 Top-5。
+    """
+    from app.embedding import HashingEmbedding
+
+    embedding = HashingEmbedding(32)
+    rows = [
+        {
+            "chunk_id": 1, "document_id": 1, "chunk_index": 0,
+            "content": "Shor 算法的定义。", "distance": 0.35,
+            "title": "Shor 算法", "file_path": "quantum/shor.md", "heading": "定义",
+        }
+    ]
+    rows.extend(
+        {
+            "chunk_id": i, "document_id": i, "chunk_index": 0,
+            "content": f"无关候选 {i}。", "distance": 0.60,
+            "title": f"其他文档 {i}", "file_path": f"other/{i}.md", "heading": "正文",
+        }
+        for i in range(2, 18)
+    )
+    rows.append(
+        {
+            "chunk_id": 18, "document_id": 1, "chunk_index": 1,
+            "content": "Shor 算法的实验进展。", "distance": 0.50,
+            "title": "Shor 算法", "file_path": "quantum/shor.md", "heading": "实验进展",
+        }
+    )
+    rows.extend(
+        {
+            "chunk_id": i, "document_id": i, "chunk_index": 0,
+            "content": f"无关候选 {i}。", "distance": 0.60,
+            "title": f"其他文档 {i}", "file_path": f"other/{i}.md", "heading": "正文",
+        }
+        for i in range(19, 61)
+    )
+    store = _CandidateStore(rows)
+    retriever = Retriever(embedding, store, default_top_k=5)
+
+    hits = retriever.search("Shor 算法的实验进展有哪些？")
+
+    assert store.requested == [50]
+    assert hits[0].heading == "实验进展"
+    # 混合排序把较低原始相似度的目标章节排到前面，但 score 仍保持
+    # Chroma 原始余弦相似度，不能把内部 _rank_score 泄漏给调用方。
+    assert round(hits[0].score, 2) == 0.50
+    assert hits[1].heading == "定义"
+    assert round(hits[1].score, 2) == 0.65
+    assert len(hits) == 5
+    assert retriever.last_debug["candidates"] == 50
+
+
+def test_lexical_match_never_demotes_vector_candidate():
+    """精确标题命中只加分，不应因短标题的词面分低于向量分而降权。"""
+    from app.embedding import HashingEmbedding
+
+    embedding = HashingEmbedding(32)
+    store = _CandidateStore([
+        {
+            "chunk_id": 1, "document_id": 1, "chunk_index": 0,
+            "content": "MVP 的定义。", "distance": 0.10,
+            "title": "MVP", "file_path": "product/mvp.md", "heading": "定义",
+        },
+        {
+            "chunk_id": 2, "document_id": 2, "chunk_index": 0,
+            "content": "其他文档。", "distance": 0.15,
+            "title": "其他文档", "file_path": "other.md", "heading": "正文",
+        },
+    ])
+    retriever = Retriever(embedding, store, default_top_k=1)
+
+    hits = retriever.search("MVP", top_k=1)
+
+    assert hits[0].title == "MVP"
+    # 仍然返回原始向量相似度，而不是内部混合排名分数。
+    assert round(hits[0].score, 2) == 0.90
+
+
+def test_diversity_can_return_more_than_twenty_results(tmp_path):
+    from app.embedding import HashingEmbedding
+
+    embedding = HashingEmbedding(32)
+    store = ChromaStore(tmp_path / "diverse_chroma")
+    rows = [
+        {
+            "chunk_id": i + 1, "document_id": i + 1, "chunk_index": 0,
+            "content": f"不同文档 {i}", "embedding": embedding.embed_query(f"不同文档 {i}"),
+        }
+        for i in range(30)
+    ]
+    try:
+        store.upsert_chunks(rows)
+        store.write_index_info(embedding.fingerprint)
+        retriever = Retriever(embedding, store, diversity_enabled=True)
+
+        hits = retriever.search("不同文档", top_k=25)
+
+        assert len(hits) == 25
+        assert len({hit.document_id for hit in hits}) == 25
+    finally:
+        store.close()
+
+
+def test_diversity_debug_counts_candidates_before_selection(ingested):
+    store, embedding, _ = ingested
+    retriever = Retriever(embedding, store, diversity_enabled=True, max_chunks_per_document=1)
+
+    hits = retriever.search("合同违约", top_k=5)
+
+    assert len(hits) == 2
+    assert retriever.last_debug["candidates"] == store.count()
+    assert retriever.last_debug["returned"] == 2

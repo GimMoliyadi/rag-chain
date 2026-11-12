@@ -10,19 +10,40 @@ engine 第一次工具调用时构建一次并常驻复用：bge-m3 权重 2.17 
 from __future__ import annotations
 
 import atexit
+import sys
 import time
 from typing import Literal
 
+
+def _configure_stdio_utf8() -> None:
+    """Keep the standalone MCP subprocess streams decodable by its host."""
+    # Codex reads both MCP stdout and stderr as UTF-8.  On Windows a spawned
+    # Python process otherwise inherits the GBK console encoding; model-loading
+    # logs (and Chinese diagnostics) then make the host's stderr reader fail
+    # with an invalid-UTF-8 error before a tool result can be delivered.
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
+# Importing this module is also supported by the HTTP app and the test suite;
+# only the stdio MCP entrypoint may alter process-global stream encodings.
+if __name__ == "__main__":
+    _configure_stdio_utf8()
+
 from mcp.server.mcpserver import MCPServer
 
+from app.citations import citation_warning
 from app.config import Settings
 from app.engine import build_engine
 from app.evidence import STATUS_INSUFFICIENT
-from app.rag import MODE_NORMAL, RAGAnswer, RAGEngine
+from app.rag import (
+    ANSWER_VERIFICATION_UNAVAILABLE_ANSWER,
+    MODE_NORMAL,
+    RAGAnswer,
+    RAGEngine,
+)
 from app.retriever import EmbeddingMismatchError, SearchResult
-
-# 和 ask.py 保持一致：引用来源只展示开头这么多字符，剩下的让用户自己打开文件看
-SOURCE_PREVIEW_CHARS = 200
 
 # 和 app.main.ChatRequest 的约束保持一致：top_k 上限 20
 MAX_TOP_K = 20
@@ -31,18 +52,18 @@ INSTRUCTIONS = """\
 你的 Obsidian 知识库检索工具（私人笔记，只读，不改任何文件）。
 
 - ask：问自然语言问题，返回带引用来源的答案。默认用它。
-- search：只检索不调 LLM，返回语义最相近的原文片段。当 ask 的答案来源不对、
-  或者你想直接看笔记原文时用它。
+- search：只检索不调 LLM，按综合相关性返回原文片段，并显示原始向量相似度。
+  当 ask 的答案来源不对、或者你想直接看笔记原文时用它。
 
-工具返回「证据不足」警告时，说明知识库里确实没有相关内容——请如实说明，
-不要基于那些语义相近的资料编造答案。
+工具返回「证据不足」警告时，只能说明本次检索返回的资料不足；不能据此断言
+知识库全库没有相关内容。请如实说明证据范围，不要基于语义相近的资料编造答案。
 """
 
 
 _ENGINE_STATE: tuple[RAGEngine, Settings] | None = None
 
 
-def _engine() -> tuple[RAGEngle, Settings]:
+def _engine() -> tuple[RAGEngine, Settings]:
     """懒加载引擎单例，返回 (engine, 生效的 settings)。
 
     MCP 握手必须在 30 秒超时内完成，而加载 bge-m3 权重（2.17 GB、391 个分片）
@@ -70,7 +91,7 @@ def build_server() -> MCPServer:
     ) -> str:
         """在你的 Obsidian 知识库里检索并生成带引用来源的回答。
 
-        返回答案正文 + 引用来源（文档名、文件路径、相似度）+ 检索状态。
+        返回答案正文 + 引用来源（文档名、文件路径、相关性分数）+ 检索状态。
         mode="advisor" 时额外注入 personal_context/context.yaml 里的当前情况。
         """
         engine, settings = _engine()
@@ -86,8 +107,8 @@ def build_server() -> MCPServer:
     def search(question: str, top_k: int | None = None) -> str:
         """在你的知识库里按语义检索原文片段，先按知识域过滤再检索。
 
-        返回相似度排名和文件路径，不调 LLM。用来排查检索效果：
-        看期望的文档排在第几、被什么挤掉了。
+        返回综合相关性排名、原始向量相似度和文件路径，不调 LLM。
+        用来排查检索效果：看期望的文档排在第几、被什么挤掉了。
         """
         engine, settings = _engine()
         k = _clamp_top_k(top_k, settings.top_k)
@@ -140,16 +161,43 @@ def render_answer(result: RAGAnswer, elapsed: float) -> str:
     资料当依据往下编——这正是本项目立 evidence gate 的全部意义。
     """
     lines: list[str] = []
-    if result.evidence is not None and result.evidence.status == STATUS_INSUFFICIENT:
+    verification_failed = (
+        result.answer_verification is not None
+        and not result.answer_verification.passed
+    )
+    warning = citation_warning(result.citation_check)
+    if warning:
+        lines += [f"**{warning}**", ""]
+    if verification_failed:
         lines += [
-            "**警告：知识库不足以回答这个问题**",
+            "**警告：最终答案未通过逐项证据核对，未输出原回答**",
             "",
-            "检索到的资料语义相近，但证据判定为 insufficient，不能当作答案依据。"
-            "请如实说明知识库里没有相关内容，不要基于这些资料编造答案。",
+            "为避免编造，不能把检索到的来源当作本次答案的依据；"
+            "下方来源只表示检索命中，不代表支持任何未核验主张。",
             "",
         ]
-    lines += [result.answer, ""]
-    lines += _render_sources(result)
+    if result.evidence is not None and result.evidence.status == STATUS_INSUFFICIENT:
+        if result.evidence.debug.get("strict_fail_closed"):
+            lines += [
+                "**警告：证据评审未完成，未生成答案**",
+                "",
+                "本次检索资料的充分性无法确认。为避免编造，不能把这些资料当作答案依据；"
+                "这不代表知识库全库不存在相关内容。",
+                "",
+            ]
+        else:
+            lines += [
+                "**警告：本次检索资料不足以回答这个问题**",
+                "",
+                "检索到的资料语义相近，但证据判定为 insufficient，不能当作答案依据。"
+                "这不代表知识库全库不存在相关内容，请不要基于这些资料编造答案。",
+                "",
+            ]
+    # 严格拒答时即便有自定义调用方误把原回答放进 RAGAnswer，也不能在 MCP
+    # 渠道重新回显；正常 RAGEngine 已经使用同一份固定拒答文案。
+    answer = ANSWER_VERIFICATION_UNAVAILABLE_ANSWER if verification_failed else result.answer
+    lines += [answer, ""]
+    lines += _render_sources(result, verified=not verification_failed)
     lines += _render_status(result, elapsed)
     return "\n".join(lines).rstrip()
 
@@ -161,30 +209,27 @@ def render_hits(hits: list[SearchResult]) -> str:
     lines = [f"检索到 {len(hits)} 条片段：", ""]
     for i, hit in enumerate(hits):
         heading = f" / {hit.heading}" if hit.heading else ""
-        preview = _preview(hit.content)
-        lines.append(f"[{i + 1}] 相似度 {hit.score:.4f}")
+        lines.append(f"[{i + 1}] 原始向量相似度 {hit.score:.4f}")
         lines.append(f"    文档：{hit.title}{heading}")
         lines.append(f"    文件：{hit.file_path}")
-        lines.append(f"    原文：{preview}")
+        lines.append(f"    原文：{hit.content}")
         lines.append("")
     return "\n".join(lines).rstrip()
 
 
-def _preview(content: str) -> str:
-    """截断超长原文，超出部分留给用户自己打开文件看。"""
-    if len(content) <= SOURCE_PREVIEW_CHARS:
-        return content
-    return content[:SOURCE_PREVIEW_CHARS] + "…"
+def _render_sources(result: RAGAnswer, *, verified: bool = True) -> list[str]:
+    """引用来源，编号和答案正文里的 [1][2] 一一对应。
 
-
-def _render_sources(result: RAGAnswer) -> list[str]:
-    """引用来源，编号和答案正文里的 [1][2] 一一对应。"""
+    最终核验失败时改成“检索命中但不可作答依据”的标题，避免上层模型把
+    来源列表误当成已经支持了被拦截答案。
+    """
     if not result.sources:
         return []
-    lines = ["**引用来源**", ""]
+    heading = "**引用来源**" if verified else "**检索来源（未核验，不可作为答案依据）**"
+    lines = [heading, ""]
     for source in result.sources:
         heading = f" / {source.heading}" if source.heading else ""
-        lines.append(f"[{source.index}] 相似度 {source.score:.4f}")
+        lines.append(f"[{source.index}] 相关性分数 {source.score:.4f}")
         lines.append(f"    文档：{source.title}{heading}")
         lines.append(f"    文件：{source.file_path}")
         lines.append("")
@@ -199,10 +244,30 @@ def _render_status(result: RAGAnswer, elapsed: float) -> list[str]:
     lines = ["**检索状态**", ""]
     if result.evidence is not None:
         ev = result.evidence
-        note = "（Judge 失败兜底，非真实评审）" if ev.debug.get("judge_error") else ""
+        if ev.debug.get("strict_fail_closed"):
+            note = "（Judge 失败，严格模式已拒绝生成）"
+        elif ev.debug.get("judge_error"):
+            note = "（Judge 失败兜底，非真实评审）"
+        else:
+            note = ""
         lines.append(f"- 证据：{ev.status} (confidence {ev.confidence:.2f}){note}")
         if ev.reason:
             lines.append(f"  理由：{ev.reason}")
+    if result.answer_verification is not None:
+        verification = result.answer_verification
+        public = verification.to_dict()
+        if verification.passed:
+            note = ""
+        else:
+            note = "（未通过，原回答未输出）"
+        lines.append(
+            f"- 最终答案核验：{public['status']}"
+            f"（主张 {public['claim_count']} 条，未支持 {public['unsupported_claim_count']} 条）{note}"
+        )
+        if not verification.passed:
+            # 只读 to_dict() 的安全理由；不要把 verifier 的逐条 claim/reason
+            # 或 unsupported_claims 送进 MCP 对话。
+            lines.append(f"  理由：{public['reason']}")
     if result.route is not None:
         rt = result.route
         lines.append(f"- 路由：mode={rt.mode} domains={rt.domains} origin={rt.origin}")

@@ -107,6 +107,7 @@ def main() -> None:
     print(f"新增文档    : {stats.added}")
     print(f"更新文档    : {stats.updated}")
     print(f"未变化跳过  : {stats.unchanged}   ← 增量生效，重复跑不会重复插库")
+    print(f"元数据同步  : {stats.metadata_updated}   ← 正文不变，仅同步 SQLite + Chroma metadata")
     if args.path is None and args.limit is None:
         print(f"删除同步    : {stats.removed}   ← 文件已删、库里已清，不会留幽灵知识")
     else:

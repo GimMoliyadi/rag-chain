@@ -18,10 +18,15 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
+from .citations import check_citations
 from .context_filter import prepare_context
 from .evidence import (
+    AnswerVerification,
+    AnswerVerifier,
+    ANSWER_STATUS_UNVERIFIED,
     STATUS_INSUFFICIENT,
     STATUS_PARTIAL,
+    STATUS_SUFFICIENT,
     EvidenceGate,
     EvidenceVerdict,
 )
@@ -42,19 +47,21 @@ VALID_MODES = frozenset({MODE_NORMAL, MODE_ADVISOR})
 # 检索不到可用 chunk 时的固定回复。answer() 和 answer_stream() 都引用这一份，
 # 两处各写一遍的话，改一处漏一处就是调用方看到两套措辞。
 EMPTY_KNOWLEDGE_BASE_ANSWER = (
-    "知识库中目前没有足够的信息回答这个问题。可能原因：还没有 ingest 任何文档，"
-    "你的问题在知识库里找不到对应内容，或者检索到的段落没有实质内容（例如纯链接导航）。"
-    "可以先调用 POST /api/ingest 导入文档。"
+    "本次检索没有返回可用资料，因此暂不生成答案。"
+    "这只表示当前检索结果不足，不代表知识库中不存在相关内容。"
+    "可以先调用 POST /api/ingest 导入或更新文档，然后重试。"
 )
 
 SYSTEM_PROMPT = """你是「{vault_name}」知识库的问答助手。请严格遵守：
 
 1. 只依据【参考资料】回答，不要使用参考资料之外的知识。
-2. 每一处结论后面标注它来自哪条资料，用上标编号，例如：公司必须做风险评估[1]。
-3. 如果参考资料不足以回答问题，直接说明「知识库中目前没有足够的信息回答这个问题」，
-   并简要说明缺的是哪方面的内容。绝不要编造答案。
-4. 不要编造引用编号：只能引用下方真实存在的编号。
-5. 回答用中文，结构清晰，必要时用列表。
+2. 每一处来自参考资料的事实、定义、数字、条件或结论都必须在同一句末尾标注它来自哪条资料，用上标编号，例如：公司必须做风险评估[1]。不要写没有引用的事实性开场概述；如果需要过渡，只写不包含事实的短标题或连接语。
+3. 标注要落在**承载该事实的那一行本身**：独立成行的公式、每个列表项、表格的每一行、代码块都要各自在行末标引用编号。不要把一条事实写成单独一行、再把引用编号只标在下一段的说明句上。
+4. 标题、过渡语、连接词、「其中：」这类纯结构文字不是事实，不要给它们标引用编号。
+5. 如果参考资料不足以回答问题，直接说明「本次检索到的资料不足以支持这个问题」，
+   并简要说明缺的是哪方面的内容。绝不要编造答案，也不要把本次检索不足说成知识库全库不存在。
+6. 不要编造引用编号：只能引用下方真实存在的编号。每一条引用都要指向**真正写出这个事实的那条资料**——相关但没有写出该事实的资料不要一起标上，多标一条会让人无法核对来源。
+7. 回答用中文，结构清晰，必要时用列表。
 """
 
 USER_PROMPT_TEMPLATE = """【参考资料】
@@ -68,7 +75,7 @@ USER_PROMPT_TEMPLATE = """【参考资料】
 # 证据评审判定 partial 时附加到 system prompt 的条款：允许回答，
 # 但必须把「有依据的」和「缺依据的」分开说，不许用资料外知识补全。
 PARTIAL_EVIDENCE_ADDENDUM = """
-6. 证据评审判定这些资料只覆盖了问题的部分方面。回答时必须明确区分：
+8. 证据评审判定这些资料只覆盖了问题的部分方面。回答时必须明确区分：
    - 「知识库能够支持的部分」：依据参考资料正常回答并标注引用编号；
    - 「知识库当前缺少依据的部分」：明确说明这部分在知识库中没有找到资料，
      绝不要用参考资料之外的知识补全。
@@ -78,9 +85,20 @@ PARTIAL_EVIDENCE_ADDENDUM = """
 # 让模型自己写拒答，它十有八九会顺手用自身知识把答案也写了。
 # missing 部分来自 Judge 给出的 unsupported_aspects，让拒答具体而不是一句空话。
 INSUFFICIENT_ANSWER_TEMPLATE = (
-    "当前知识库中没有足够资料支持这个问题。\n\n"
+    "本次检索到的资料不足以支持这个问题。\n\n"
     "缺少的依据：{missing}\n\n"
-    "下面列出的引用只是与问题语义相近的资料，不足以作为答案依据，仅供参考。"
+    "下面列出的引用只是本次检索返回的资料，不足以作为答案依据，仅供参考。"
+    "这不代表知识库中不存在相关内容。"
+)
+
+EVIDENCE_REVIEW_UNAVAILABLE_ANSWER = (
+    "证据评审未完成，无法确认本次检索资料是否足以支持回答；为避免编造，暂不生成答案。"
+    "这不代表知识库中不存在相关内容，请稍后重试。"
+)
+
+ANSWER_VERIFICATION_UNAVAILABLE_ANSWER = (
+    "最终答案未通过逐项证据核对，未输出原回答；为避免编造，暂不生成答案。"
+    "这不代表知识库中不存在相关内容，请稍后重试。"
 )
 
 # ---- advisor 模式（Personal Context + 知识库）的 Prompt ----
@@ -96,7 +114,8 @@ SYSTEM_PROMPT_ADVISOR = """你是「{vault_name}」的个人顾问。你会收�
 1. 【用户当前情况】里没有提到的信息，视同不知道。不要推断、不要补全、不要假设用户的处境。
    如果这一块标注为「当前没有个人状态信息」，必须在回答开头明确说明：缺少用户的当前情况，
    只能给出一般性分析，无法针对用户实际处境判断。
-2. 【知识库资料】里没有的事实，绝不用你记忆中的知识补全；缺就明说缺。
+2. 【知识库资料】里没有的事实，绝不用你记忆中的知识补全；缺就明说当前检索资料缺少依据，
+   不要把本次检索不足说成知识库全库不存在。
 3. 每一处来自知识库的结论后面用上标标注引用编号，例如：长期合作能降低反复博弈的成本[1]。
    只能引用下面真实存在的编号，不要编造。
 4. 分析和建议必须明确是你的判断，不能写成知识库原文，也不能写成用户已确认的事实。
@@ -167,6 +186,10 @@ class RAGAnswer:
     mode: str = MODE_NORMAL
     # Personal Context 的读取结果；只有 advisor 模式才有值，normal 模式为 None。
     personal_context: dict | None = None
+    # 仅检查生成文本中的引用编号，不能证明结论得到原文支持。
+    citation_check: dict | None = None
+    # 严格模式下对最终回答的逐项证据核对；未启用严格模式时为 None。
+    answer_verification: AnswerVerification | None = None
 
 
 class RAGEngine:
@@ -190,7 +213,11 @@ class RAGEngine:
         evidence_rescue_k: int = 20,
         rescue_retriever: Retriever | None = None,
         personal_context_loader: Callable[[], PersonalContext] | None = None,
+        strict_evidence: bool = False,
+        answer_verifier: AnswerVerifier | None = None,
     ):
+        if strict_evidence and evidence_gate is None:
+            raise ValueError("strict_evidence 需要 evidence_gate：严格模式必须先完成证据评审")
         if evidence_rescue_enabled and evidence_gate is None:
             raise ValueError("evidence_rescue_enabled 需要 evidence_gate，救援是在第一次评审之后跑的")
         if evidence_rescue_enabled and rescue_retriever is None:
@@ -220,6 +247,15 @@ class RAGEngine:
         self._evidence_rescue_enabled = evidence_rescue_enabled
         self._evidence_rescue_k = evidence_rescue_k
         self._rescue_retriever = rescue_retriever
+        # 严格模式只改变 Evidence Gate 已启用时的失败处理：评审失败不再
+        # fail-open 进入生成。未启用 Gate 时保持历史行为，参数也不产生副作用。
+        self._strict_evidence = strict_evidence
+        # 严格模式必须有最终答案核对；默认复用同一个 LLM 客户端，测试和
+        # 上层也可以注入替身。非严格模式不构造、不调用，保持历史行为。
+        self._answer_verifier = (
+            (answer_verifier or AnswerVerifier(llm))
+            if strict_evidence else None
+        )
         # Personal Context 通过 loader 注入：默认由 create_app 绑到配置文件，
         # 测试里换成返回固定 PersonalContext 的 lambda 即可，不必碰文件系统。
         self._personal_context_loader = personal_context_loader
@@ -227,7 +263,9 @@ class RAGEngine:
     @property
     def rerank_stats(self) -> RerankStats | None:
         """精排的观测数据；未启用精排时为 None。A/B 表里的耗时增量从这里取。"""
-        return self._reranker.stats if self._reranker is not None else None
+        if self._reranker is not None:
+            return self._reranker.stats
+        return getattr(self._retriever, "rerank_stats", None)
 
     @property
     def retriever(self) -> Retriever:
@@ -292,11 +330,12 @@ class RAGEngine:
         # 所以必须在精排 / 过滤 / 去重全部完成之后。
         evidence_hits = hits[:MAX_CITATIONS]
         evidence_contents = contents
+        context = _build_context(evidence_hits, evidence_contents)
         verdict: EvidenceVerdict | None = None
         if self._evidence_gate is not None:
             started = time.perf_counter()
-            verdict = self._evidence_gate.judge(
-                question, evidence_hits, personal_context=personal_context_text,
+            verdict = self._judge_evidence(
+                question, evidence_hits, personal_context_text, context,
             )
             timings["evidence_judge_ms"] = _elapsed_ms(started)
             timings["first_evidence_status"] = verdict.status
@@ -305,13 +344,18 @@ class RAGEngine:
                 timings["rescue_triggered"] = False
 
             # Evidence Rescue：只在第一次评审不足时跑一次，sufficient / partial 不多花一步
-            if verdict.status == STATUS_INSUFFICIENT and self._evidence_rescue_enabled:
+            if (
+                verdict.status == STATUS_INSUFFICIENT
+                and not verdict.debug.get("judge_error")
+                and self._evidence_rescue_enabled
+            ):
                 evidence_hits, verdict = self._rescue(
                     question, domains, evidence_hits, verdict, personal_context_text, timings,
                 )
                 if timings.get("rescue_triggered"):
                     # 救援池没有经过首轮的 context 清洗，只能退回原文
                     evidence_contents = None
+                    context = _build_context(evidence_hits, evidence_contents)
 
             timings["final_evidence_status"] = verdict.status
 
@@ -328,11 +372,14 @@ class RAGEngine:
                 )
 
         partial = verdict is not None and verdict.status == STATUS_PARTIAL
-        context = _build_context(evidence_hits, evidence_contents)
+        personal_context_for_prompt = (
+            personal_context_text or PERSONAL_CONTEXT_UNAVAILABLE_NOTE
+            if mode == MODE_ADVISOR else None
+        )
         if mode == MODE_ADVISOR:
             messages = _build_advisor_messages(
                 question, context, self._vault_name,
-                personal_context=personal_context_text or PERSONAL_CONTEXT_UNAVAILABLE_NOTE,
+                personal_context=personal_context_for_prompt,
                 partial=partial,
             )
         else:
@@ -340,12 +387,35 @@ class RAGEngine:
         started = time.perf_counter()
         answer = self._llm.chat(messages)
         timings["answer_generation_ms"] = _elapsed_ms(started)
+        citation_check = check_citations(answer, len(evidence_hits))
+        answer_verification: AnswerVerification | None = None
+        if self._strict_evidence:
+            started = time.perf_counter()
+            answer_verification = self._verify_answer(
+                question, answer, context, citation_check,
+                personal_context=personal_context_for_prompt,
+                advisor_mode=mode == MODE_ADVISOR,
+                personal_context_available=personal_context_text is not None,
+            )
+            timings["answer_verification_ms"] = _elapsed_ms(started)
+            if not answer_verification.passed:
+                return RAGAnswer(
+                    answer=ANSWER_VERIFICATION_UNAVAILABLE_ANSWER,
+                    sources=_to_sources(evidence_hits),
+                    used_chunks=len(evidence_hits),
+                    timings=timings, route=route, evidence=verdict,
+                    mode=mode, personal_context=personal_context_info,
+                    citation_check=None,
+                    answer_verification=answer_verification,
+                )
         return RAGAnswer(
             answer=answer,
             sources=_to_sources(evidence_hits),
             used_chunks=len(evidence_hits),
             timings=timings, route=route, evidence=verdict,
             mode=mode, personal_context=personal_context_info,
+            citation_check=citation_check,
+            answer_verification=answer_verification,
         )
 
     def _route_if_needed(
@@ -389,8 +459,8 @@ class RAGEngine:
 
         timings["rescue_triggered"] = True
         started = time.perf_counter()
-        second_verdict = self._evidence_gate.judge(
-            question, rescue_hits, personal_context=personal_context,
+        second_verdict = self._judge_evidence(
+            question, rescue_hits, personal_context, _build_context(rescue_hits),
         )
         timings["rescue_evidence_ms"] = _elapsed_ms(started)
         # 留个标记：这条结论是救援产生的，统计时能把「首轮就判出来的」和
@@ -413,6 +483,94 @@ class RAGEngine:
         return _dedup_by_chunk_id(
             self._rescue_retriever.search(question, top_k=self._evidence_rescue_k, domains=domains)
         )
+
+    def _judge_evidence(
+        self,
+        question: str,
+        hits: list[SearchResult],
+        personal_context: str | None,
+        context: str,
+    ) -> EvidenceVerdict:
+        """统一执行证据评审，保证阻塞和流式路径采用同一失败策略。
+
+        EvidenceGate 自身会把内部调用异常规整成 EvidenceVerdict；这里额外
+        处理注入的 Gate 实现直接抛异常的情况。严格模式 fail-closed，非严格
+        模式保留原行为（answer 抛错、answer_stream 发 error 事件）。
+        """
+        assert self._evidence_gate is not None
+        try:
+            verdict = self._evidence_gate.judge(
+                question,
+                hits,
+                personal_context=personal_context,
+                evidence_context=context,
+            )
+        except Exception as exc:
+            if not self._strict_evidence:
+                raise
+            return _strict_evidence_failure(f"Evidence Gate 异常：{type(exc).__name__}")
+
+        if self._strict_evidence and not isinstance(verdict, EvidenceVerdict):
+            # 注入替身或未来实现若没有返回完整的 EvidenceVerdict，严格模式也
+            # 不能把未知对象当成“评审通过”。非严格模式维持旧行为，让异常
+            # 继续暴露给原有调用方，而不是偷偷改变其契约。
+            return _strict_evidence_failure("Evidence Gate 返回无效结论")
+
+        if self._strict_evidence and (
+            verdict.status not in {STATUS_SUFFICIENT, STATUS_PARTIAL, STATUS_INSUFFICIENT}
+            or not isinstance(verdict.debug, dict)
+        ):
+            return _strict_evidence_failure("Evidence Gate 返回无效结论")
+
+        if self._strict_evidence and verdict.debug.get("judge_error"):
+            # 即使调用方注入的是旧版 fail-open EvidenceGate，也不允许
+            # 严格 RAGEngine 把这次未确认的 verdict 交给生成模型。
+            return _strict_evidence_failure(
+                str(verdict.debug.get("fallback_reason") or "Evidence Gate 失败")
+            )
+        return verdict
+
+    def _verify_answer(
+        self,
+        question: str,
+        answer: str,
+        context: str,
+        citation_check: dict,
+        *,
+        personal_context: str | None = None,
+        advisor_mode: bool = False,
+        personal_context_available: bool | None = None,
+    ) -> AnswerVerification:
+        """严格模式下核对最终回答；异常一律转为拒答结果。"""
+        assert self._answer_verifier is not None
+        try:
+            if advisor_mode:
+                kwargs = {
+                    "personal_context": personal_context,
+                    "advisor_mode": True,
+                }
+                # 内置 verifier 额外需要知道“不可用占位正文”和真正的
+                # Personal Context 的区别；旧版注入替身只应收到它原先能
+                # 理解的 advisor 参数，避免因为新增诊断参数而被严格模式
+                # 误判为核验失败。
+                if isinstance(self._answer_verifier, AnswerVerifier):
+                    kwargs["personal_context_available"] = personal_context_available
+                return self._answer_verifier.verify(
+                    question, answer, context, citation_check, **kwargs,
+                )
+            # 不给 normal 的自定义 verifier 追加 advisor 参数，保持旧版
+            # 注入替身的四参数契约；normal 的严格语义也由 verifier 默认保证。
+            return self._answer_verifier.verify(question, answer, context, citation_check)
+        except Exception:
+            # 自定义 verifier / 上游实现不应绕过严格门；这里不把异常文字
+            # 写进用户答案，避免把内部错误或原回答片段泄露出去。
+            return AnswerVerification(
+                status=ANSWER_STATUS_UNVERIFIED,
+                confidence=0.0,
+                reason="最终答案证据核对未完成，未输出原回答。",
+                citation_check=citation_check,
+                debug={"judge_error": True, "strict_fail_closed": True},
+            )
 
     def _load_personal_context(self) -> tuple[str | None, dict]:
         """读取并渲染 Personal Context，返回 (Prompt 正文或 None, 调试信息)。
@@ -437,6 +595,19 @@ class RAGEngine:
         return rendered, context.to_debug_dict()
 
     def answer_stream(
+        self,
+        question: str,
+        top_k: int | None = None,
+        domains: list[str] | None = None,
+        mode: str = MODE_NORMAL,
+    ) -> Iterator[dict]:
+        """流式链路的任意阶段都必须以 error 事件结束，而不是断开 SSE。"""
+        try:
+            yield from self._answer_stream(question, top_k=top_k, domains=domains, mode=mode)
+        except Exception as exc:
+            yield {"event": "error", "data": {"message": str(exc)}}
+
+    def _answer_stream(
         self,
         question: str,
         top_k: int | None = None,
@@ -512,17 +683,20 @@ class RAGEngine:
                     "timings": timings, "route": _route_dict(route) if route else None,
                     "evidence": None,
                     "mode": mode, "personal_context": personal_context_info,
+                    "citation_check": None,
+                    "answer_verification": None,
                 },
             }
             return
 
         evidence_hits = numbered
         evidence_contents = contents
+        context = _build_context(evidence_hits, evidence_contents)
         verdict: EvidenceVerdict | None = None
         if self._evidence_gate is not None:
             evidence_started = time.perf_counter()
-            verdict = self._evidence_gate.judge(
-                question, evidence_hits, personal_context=personal_context_text,
+            verdict = self._judge_evidence(
+                question, evidence_hits, personal_context_text, context,
             )
             timings["evidence_judge_ms"] = _elapsed_ms(evidence_started)
             timings["first_evidence_status"] = verdict.status
@@ -534,13 +708,18 @@ class RAGEngine:
             }
 
             # 与非流式 answer() 同一个入口：只在第一次评审不足时救援一次
-            if verdict.status == STATUS_INSUFFICIENT and self._evidence_rescue_enabled:
+            if (
+                verdict.status == STATUS_INSUFFICIENT
+                and not verdict.debug.get("judge_error")
+                and self._evidence_rescue_enabled
+            ):
                 evidence_hits, verdict = self._rescue(
                     question, domains_effective, evidence_hits, verdict,
                     personal_context_text, timings,
                 )
                 if timings.get("rescue_triggered"):
                     evidence_contents = None
+                    context = _build_context(evidence_hits, evidence_contents)
             timings["final_evidence_status"] = verdict.status
 
             # 只在救援真正开启时才发这个事件：纯 Gate 路径保持原有的事件序列，
@@ -571,16 +750,21 @@ class RAGEngine:
                         "route": _route_dict(route) if route else None,
                         "evidence": verdict.to_dict(),
                         "mode": mode, "personal_context": personal_context_info,
+                        "citation_check": None,
+                        "answer_verification": None,
                     },
                 }
                 return
 
         partial = verdict is not None and verdict.status == STATUS_PARTIAL
-        context = _build_context(evidence_hits, evidence_contents)
+        personal_context_for_prompt = (
+            personal_context_text or PERSONAL_CONTEXT_UNAVAILABLE_NOTE
+            if mode == MODE_ADVISOR else None
+        )
         if mode == MODE_ADVISOR:
             messages = _build_advisor_messages(
                 question, context, self._vault_name,
-                personal_context=personal_context_text or PERSONAL_CONTEXT_UNAVAILABLE_NOTE,
+                personal_context=personal_context_for_prompt,
                 partial=partial,
             )
         else:
@@ -592,7 +776,10 @@ class RAGEngine:
         try:
             for chunk in self._llm.chat_stream(messages):
                 parts.append(chunk)
-                yield {"event": "token", "data": {"text": chunk}}
+                # 严格模式必须等最终答案核对通过后才把 token 交给调用方；
+                # 非严格模式保留原有的即时流式行为。
+                if not self._strict_evidence:
+                    yield {"event": "token", "data": {"text": chunk}}
         except Exception as exc:
             # 已经吐过一部分 token 时上游挂了，保留已生成的内容 + 一条错误，
             # 调用方至少能看到半篇回答，而不是什么都没留下。
@@ -600,16 +787,52 @@ class RAGEngine:
             return
 
         timings["answer_generation_ms"] = _elapsed_ms(generation_started)
+        answer = "".join(parts)
+        citation_check = check_citations(answer, len(evidence_hits))
+        answer_verification: AnswerVerification | None = None
+        if self._strict_evidence:
+            verification_started = time.perf_counter()
+            answer_verification = self._verify_answer(
+                question, answer, context, citation_check,
+                personal_context=personal_context_for_prompt,
+                advisor_mode=mode == MODE_ADVISOR,
+                personal_context_available=personal_context_text is not None,
+            )
+            timings["answer_verification_ms"] = _elapsed_ms(verification_started)
+            if not answer_verification.passed:
+                # 未通过时只输出固定拒答，parts 中的原回答永远不会成为
+                # token 或 done.answer，避免流式先泄露后撤回。
+                yield {
+                    "event": "done",
+                    "data": {
+                        "answer": ANSWER_VERIFICATION_UNAVAILABLE_ANSWER,
+                        "used_chunks": len(evidence_hits),
+                        "elapsed_ms": _elapsed_ms(total_started),
+                        "timings": timings,
+                        "route": _route_dict(route) if route else None,
+                        "evidence": verdict.to_dict() if verdict else None,
+                        "mode": mode, "personal_context": personal_context_info,
+                        "citation_check": None,
+                        "answer_verification": answer_verification.to_dict(),
+                    },
+                }
+                return
+
+            # 评审通过后再补发缓冲期间的 token，调用方仍可按原协议重组答案。
+            for chunk in parts:
+                yield {"event": "token", "data": {"text": chunk}}
         yield {
             "event": "done",
             "data": {
-                "answer": "".join(parts),
+                "answer": answer,
                 "used_chunks": len(evidence_hits),
                 "elapsed_ms": _elapsed_ms(total_started),
                 "timings": timings,
                 "route": _route_dict(route) if route else None,
                 "evidence": verdict.to_dict() if verdict else None,
                 "mode": mode, "personal_context": personal_context_info,
+                "citation_check": citation_check,
+                "answer_verification": answer_verification.to_dict() if answer_verification else None,
             },
         }
 
@@ -704,8 +927,27 @@ def _normalize_mode(mode: str) -> str:
 def _insufficient_answer(verdict: EvidenceVerdict) -> str:
     """insufficient 的固定拒答文案。缺什么优先用 Judge 列的 unsupported_aspects
     （具体到方面），列不出来时退回 Judge 的一句话理由，保证拒答不是干巴巴一句。"""
+    if verdict.debug.get("strict_fail_closed"):
+        return EVIDENCE_REVIEW_UNAVAILABLE_ANSWER
     missing = "、".join(verdict.unsupported_aspects) if verdict.unsupported_aspects else verdict.reason
-    return INSUFFICIENT_ANSWER_TEMPLATE.format(missing=missing or "知识库中未找到与问题实质相关的内容")
+    return INSUFFICIENT_ANSWER_TEMPLATE.format(missing=missing or "本次检索未找到与问题实质相关的内容")
+
+
+def _strict_evidence_failure(reason: str) -> EvidenceVerdict:
+    """把未完成的评审转换为不带全库断言的严格拒答状态。"""
+    return EvidenceVerdict(
+        status=STATUS_INSUFFICIENT,
+        confidence=0.0,
+        reason=(
+            "证据评审失败，无法确认本次检索资料是否足以支持回答；"
+            "这不代表知识库中不存在相关内容。"
+        ),
+        debug={
+            "judge_error": True,
+            "strict_fail_closed": True,
+            "fallback_reason": reason,
+        },
+    )
 
 
 def _route_dict(route: RouteDecision | None) -> dict | None:
@@ -729,7 +971,7 @@ def _to_sources(hits: list[SearchResult]) -> list[Source]:
             title=h.title,
             file_path=h.file_path,
             heading=h.heading,
-            score=round(h.score, 4),
+            score=round(h.rerank_score if h.rerank_score is not None else h.score, 4),
             content=h.content,
         )
         for i, h in enumerate(hits)
@@ -759,7 +1001,7 @@ def _elapsed_ms(started: float) -> int:
 
 
 def _dedup_by_chunk_id(hits: list[SearchResult]) -> list[SearchResult]:
-    """去掉重复的 chunk，保留第一次出现的位置（即相似度更高的那次）。"""
+    """去掉重复的 chunk，保留第一次出现的位置（即检索排序更靠前的那次）。"""
     seen: set[int] = set()
     out: list[SearchResult] = []
     for hit in hits:

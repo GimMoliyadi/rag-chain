@@ -26,6 +26,8 @@ openai>=1.40
 #      这是覆盖 SDK 默认 connect=5.0s 的唯一入口
 # 另外 DefaultHttpxClient 这个公开类在 1.x 里才存在，0.x 的写法不一样。
 anthropic==1.6.0
+# HTTP 客户端读取 ALL_PROXY=socks5://... 时需要该依赖。
+socksio>=1.0,<2
 
 # 配置解析：YAML frontmatter
 pyyaml>=6.0
