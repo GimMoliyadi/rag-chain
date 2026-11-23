@@ -138,6 +138,11 @@ class ChromaStore:
             for i in range(len(ids))
         ]
 
+    def document_paths(self) -> list[str]:
+        """List the current indexed note paths without fetching chunks or vectors."""
+        result = self._col.get(include=["metadatas"])
+        return sorted({meta["file_path"] for meta in result["metadatas"] if meta and meta.get("file_path")})
+
     def delete_by_document(self, document_id: int) -> None:
         """删掉某个文档的全部向量。
 

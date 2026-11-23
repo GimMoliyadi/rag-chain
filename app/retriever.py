@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from itertools import zip_longest
 from typing import TYPE_CHECKING
 
 from .embedding import BaseEmbedding
@@ -60,6 +61,11 @@ DIVERSITY_CANDIDATE_K = 20
 LEXICAL_BOOST_WEIGHT = 0.6
 
 _NON_WORD = re.compile(r"[^\w\u3400-\u9fff]+", re.UNICODE)
+_STANDARD_CODE = re.compile(r"(?i)(?<![A-Za-z0-9])GB\s*(\d{3,})\s*[-–]\s*(\d{2,})(?![A-Za-z0-9])")
+_PATH_REFERENCE = re.compile(r"(?:《|[\"'`])([^《》\"'`\r\n]+\.md)(?:》|[\"'`])", re.IGNORECASE)
+
+_VERSION_LEAD_IN = re.compile(r"^\s*(?:(?:标准|笔记)?\s*(?:中|里|回答)?\s*[:：,，]\s*)+")
+
 
 class Retriever:
     """用 embedding + 向量库做相似度检索。"""
@@ -97,6 +103,7 @@ class Retriever:
         domains=[...] 时用 Chroma 的 metadata 过滤只在指定知识域里找。
         指定的域在库里一条 chunk 都没有时（如 fiction），不做空返回，
         回退全库检索，并记录 domain_empty_fallback=True。
+        点名标准版本或用引号指定笔记相对路径时，只在指定来源内找，不用其他版本补位。
 
         返回对象的 ``score`` 始终是原始向量余弦相似度；它不一定随返回顺序单调，
         因为标题/章节词面信号只参与内部排序。
@@ -120,6 +127,10 @@ class Retriever:
             candidate_k = max(candidate_k, self._reranker_candidate_top_k)
         if self._diversity_enabled:
             candidate_k = max(candidate_k, DIVERSITY_CANDIDATE_K)
+        scopes = _source_scopes(question)
+        if scopes:
+            return self._search_scoped(scopes, k, domains)
+
         question_vector = self._embedding.embed_query(question)
         rows = self._store.query(question_vector, n_results=min(candidate_k, count), where=where)
 
@@ -186,6 +197,111 @@ class Retriever:
             "expanded_documents": expanded_documents,
         }
         return hits
+
+    def _search_scoped(
+        self,
+        scopes: list[tuple[str, str, str]],
+        k: int,
+        domains: list[str] | None,
+    ) -> list[SearchResult]:
+        """Keep each requested subquestion inside its exact source and give it a slot."""
+        paths = self._store.document_paths()
+        groups = []
+        candidates = 0
+        fallbacks = self._reranker.stats.fallback if self._reranker else 0
+        for kind, scope, query in scopes:
+            if kind == "path":
+                selected = [path for path in paths if _canonical_path(path) == scope]
+            else:
+                selected = [
+                    path for path in paths
+                    if any(_standard_id(part) == scope for part in _canonical_path(path).split("/"))
+                ]
+            if not selected:
+                continue
+
+            where = {"file_path": {"$in": selected}}
+            if domains:
+                where = {"$and": [{"domain": {"$in": domains}}, where]}
+            rows = self._store.query(self._embedding.embed_query(query), n_results=100, where=where)
+            candidates += len(rows)
+            hits = [_to_hit(row) for row in rows]
+            if self._reranker and hits:
+                hits = self._rank_scoped(query, hits)
+            groups.append(hits)
+
+        seen = set()
+        merged = []
+        for depth in zip_longest(*groups):
+            for hit in depth:
+                if hit is not None and hit.chunk_id not in seen:
+                    seen.add(hit.chunk_id)
+                    merged.append(hit)
+        if self._diversity_enabled:
+            per_document = {}
+            limited = []
+            for hit in merged:
+                count = per_document.get(hit.document_id, 0)
+                if count < self._max_chunks_per_document:
+                    limited.append(hit)
+                    per_document[hit.document_id] = count + 1
+            merged = limited
+        hits = merged[:k]
+        fallback = self._reranker is not None and self._reranker.stats.fallback > fallbacks
+        self.last_debug = {
+            "scoped": True,
+            "domains": list(domains or []),
+            "domain_empty_fallback": False,
+            "diversity_applied": self._diversity_enabled,
+            "candidates": candidates,
+            "returned": len(hits),
+            "reranker_applied": self._reranker is not None and bool(hits) and not fallback,
+            "reranker_fallback": fallback,
+            "expanded_documents": [],
+            "source_scopes": list(dict.fromkeys(scope for _, scope, _ in scopes)),
+        }
+        return hits
+
+    def _rank_scoped(self, query: str, hits: list[SearchResult]) -> list[SearchResult]:
+        assert self._reranker is not None
+        original = {hit.chunk_id: hit for hit in hits}
+        before = self._reranker.stats.fallback
+        ranked = self._reranker.rerank(query, hits)
+        if self._reranker.stats.fallback > before:
+            return hits
+        # A section heading can answer the question more directly than a long
+        # passage. Promote it only if the body also placed it in the first three.
+        with_heading = [replace(hit, content="") for hit in hits if hit.heading]
+        if len(ranked) >= 3 and with_heading:
+            heading = self._reranker.rerank(query, with_heading, top_k=1)
+            if self._reranker.stats.fallback == before and heading[0].chunk_id == ranked[2].chunk_id:
+                ranked[1], ranked[2] = ranked[2], ranked[1]
+        return [replace(original[hit.chunk_id], rerank_score=hit.score) for hit in ranked]
+
+
+def _canonical_path(value: str) -> str:
+    return value.strip().replace("\\", "/").casefold()
+
+
+def _standard_id(value: str) -> str | None:
+    match = _STANDARD_CODE.fullmatch(value.removesuffix(".md"))
+    return f"GB{match[1]}-{match[2]}" if match else None
+
+
+def _source_scopes(question: str) -> list[tuple[str, str, str]]:
+    paths = [path for match in _PATH_REFERENCE.finditer(question) if "/" in (path := _canonical_path(match[1]))]
+    if paths:
+        return [("path", path, question) for path in dict.fromkeys(paths)]
+
+    scopes = []
+    editions = list(_STANDARD_CODE.finditer(question))
+    for i, match in enumerate(editions):
+        end = editions[i + 1].start() if i + 1 < len(editions) else len(question)
+        text = _VERSION_LEAD_IN.sub("", question[match.end():end]).strip()
+        queries = [clause.strip() for clause in re.split(r"[？?；;。]", text) if clause.strip()]
+        scope = f"GB{match[1]}-{match[2]}"
+        scopes.extend(("edition", scope, clause) for clause in (queries or [question]))
+    return scopes
 
 
 def _cap_per_document(rows: list[dict], top_k: int, max_per_document: int) -> list[dict]:

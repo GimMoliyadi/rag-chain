@@ -25,6 +25,9 @@ class _CandidateStore:
 
 
 class _ScopedCandidateStore(_CandidateStore):
+    def document_paths(self):
+        return list(dict.fromkeys(row["file_path"] for row in self.rows))
+
     def query(self, embedding, n_results=5, where=None):
         self.requested.append(where)
         def matches(row, condition):
@@ -35,6 +38,58 @@ class _ScopedCandidateStore(_CandidateStore):
             key, value = next(iter(condition.items()))
             return row.get(key) in value["$in"] if isinstance(value, dict) else row.get(key) == value
         return [row for row in self.rows if matches(row, where)][:n_results]
+
+
+def test_version_scopes_keep_each_question_and_exclude_other_editions():
+    from app.embedding import HashingEmbedding
+    from app.reranker import CrossEncoderReranker
+    from app.retriever import _source_scopes
+
+    class Model:
+        def predict(self, pairs, **kwargs):
+            scores = []
+            for query, text in pairs:
+                if "\n\n" in text and text.endswith("\n\n"):
+                    scores.append(100 if "保留期" in text else 0)
+                elif "保留" in query:
+                    scores.append(next((score for key, score in (
+                        ("相关正文甲", 30), ("相关正文乙", 20), ("期限正文", 10),
+                    ) if key in text), 0))
+                else:
+                    scores.append(100 if "温度正文" in text else 0)
+            return scores
+
+    rows = [
+        dict(chunk_id=i, document_id=i, chunk_index=0, content=body, heading=heading,
+             file_path=f"标准/{edition}/条款.md", title="条款", distance=0.25, domain="tests")
+        for i, (edition, heading, body) in enumerate([
+            ("GB1200-2024", "温度", "温度正文"), ("GB1200-2024", "适用范围", "范围正文"),
+            ("GB1300-2023", "其他计算甲", "相关正文甲"),
+            ("GB1300-2023", "其他计算乙", "相关正文乙"),
+            ("GB1300-2023", "保留期", "期限正文"),
+            ("GB1200-2011", "温度", "属于旧版的温度正文"),
+        ], 1)
+    ]
+    retriever = Retriever(HashingEmbedding(32), _ScopedCandidateStore(rows),
+                          reranker=CrossEncoderReranker(model=Model(), include_metadata=True))
+    assert _source_scopes("只按GB1200-2024答：温度是多少？湿度呢？")[-1] == (
+        "edition", "GB1200-2024", "湿度呢")
+
+    hits = retriever.search("GB1200-2024 中，温度是多少？GB1300-2023 中，保留多久？", top_k=4,
+                            domains=["tests"])
+    assert [h.chunk_id for h in hits] == [1, 3, 2, 5]
+    assert hits[-1].score == 0.75
+    assert hits[-1].rerank_score == 10
+    assert retriever.search("只按 GB1200-9999 查温度") == []
+
+
+def test_explicit_relative_path_never_substitutes_another_note(ingested):
+    store, embedding, _ = ingested
+    retriever = Retriever(embedding, store)
+
+    hits = retriever.search("只按《创业/MVP.md》回答：什么是最小可行产品？")
+    assert hits and {h.file_path for h in hits} == {"创业/MVP.md"}
+    assert retriever.search("只按《创业/不存在.md》回答：什么是最小可行产品？") == []
 
 
 def test_reranker_recovers_named_document_section_beyond_global_pool():
