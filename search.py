@@ -14,12 +14,9 @@ import argparse
 import json
 
 from app.config import Settings
-from app.embedding import get_embedding_client
-from app.engine import build_reranker
-from app.knowledge_domains import load_router_terms
-from app.retriever import Retriever
-from app.router import QueryRouter
-from app.vectorstore import ChromaStore
+from app.engine import build_engine
+from app.llm import MockLLM
+from app.search_chain import collect_search_results, content_for_hit
 
 
 def main() -> None:
@@ -33,63 +30,67 @@ def main() -> None:
         raise SystemExit("--router 和 --domains 只能二选一：一个是路由决定域，一个是手动指定域")
 
     settings = Settings()
-    settings.validate_providers()
+    # search.py 只排查检索，不应该因为真实 LLM 凭证缺失而启动失败；
+    # build_engine 仍然复用同一套 RAG 装配，但 LLM 注入 MockLLM，避免调外部服务。
+    settings.llm_provider = "mock"
+    store = None
+    try:
+        engine, store = build_engine(settings, llm=MockLLM())
+        total = store.count()
+        print(f"向量库已有 {total} 个 chunk")
+        if total == 0:
+            raise SystemExit("向量库是空的，先运行 python ingest.py 导入文档")
 
-    embedding = get_embedding_client(settings)
-    store = ChromaStore(settings.chroma_path_resolved)
-    retriever = Retriever(
-        embedding=embedding,
-        store=store,
-        default_top_k=settings.top_k,
-        diversity_enabled=settings.diversity_enabled,
-        max_chunks_per_document=settings.max_chunks_per_document,
-        reranker=build_reranker(settings),
-        reranker_candidate_top_k=settings.reranker_candidate_top_k,
-    )
+        domains = args.domains.split(",") if args.domains else None
+        search_result = collect_search_results(
+            engine,
+            args.question,
+            args.k or settings.top_k,
+            routed=args.router,
+            domains=domains,
+        )
 
-    total = store.count()
-    print(f"向量库已有 {total} 个 chunk（embedding: {embedding.model_name}）")
-    if total == 0:
-        raise SystemExit("向量库是空的，先运行 python ingest.py 导入文档")
+        if args.router:
+            decision = search_result.route
+            print("\n路由决定:")
+            print(json.dumps(
+                {
+                    "mode": decision.mode if decision else "global",
+                    "domains": decision.domains if decision else [],
+                    "confidence": decision.confidence if decision else 0,
+                    "reason": decision.reason if decision else "未启用 Router",
+                },
+                ensure_ascii=False, indent=2,
+            ))
 
-    domains = args.domains.split(",") if args.domains else None
-    decision = None
-    if args.router:
-        router = QueryRouter(load_router_terms(settings.knowledge_domains_path_resolved))
-        decision = router.route(args.question)
-        print("\n路由决定:")
-        print(json.dumps(
-            {"mode": decision.mode, "domains": decision.domains,
-             "confidence": decision.confidence, "reason": decision.reason},
-            ensure_ascii=False, indent=2,
-        ))
-        # global 时 domains 保持 None，走的是和不用 Router 完全相同的全库路径
-        domains = decision.domains or None
+        retriever = engine.retriever
+        if retriever.last_debug.get("domain_empty_fallback"):
+            print("domain_empty_fallback = true（指定域 0 chunk，已回退全库检索）")
+        hits = search_result.hits
+        if not hits:
+            print("没有检索到任何结果。")
+            return
 
-    hits = retriever.search(args.question, top_k=args.k or settings.top_k, domains=domains)
-    if retriever.last_debug.get("domain_empty_fallback"):
-        print("domain_empty_fallback = true（指定域 0 chunk，已回退全库检索）")
-    if not hits:
-        print("没有检索到任何结果。")
-        return
+        print(f"\n问题：{args.question}\n" + "=" * 60)
+        for i, hit in enumerate(hits, start=1):
+            content = content_for_hit(hit, search_result.contents)
+            preview = content if len(content) <= 300 else content[:300] + "…"
+            print(f"\nTop {i}")
+            print(f"原始向量相似度 : {hit.score:.4f}")
+            print(f"文档   : {hit.title}")
+            print(f"文件   : {hit.file_path}")
+            print(f"领域   : {hit.domain} / {hit.source_type}")
+            print(f"章节   : {hit.heading or '(无标题)'}")
+            print(f"内容   :\n{preview}")
+            print("-" * 60)
 
-    print(f"\n问题：{args.question}\n" + "=" * 60)
-    for i, hit in enumerate(hits, start=1):
-        content = hit.content
-        preview = content if len(content) <= 300 else content[:300] + "…"
-        print(f"\nTop {i}")
-        print(f"原始向量相似度 : {hit.score:.4f}")
-        print(f"文档   : {hit.title}")
-        print(f"文件   : {hit.file_path}")
-        print(f"领域   : {hit.domain} / {hit.source_type}")
-        print(f"章节   : {hit.heading or '(无标题)'}")
-        print(f"内容   :\n{preview}")
-        print("-" * 60)
-
-    debug = retriever.last_debug
-    distinct_docs = len({hit.document_id for hit in hits})
-    print(f"\n[debug] Top-{len(hits)} 覆盖 {distinct_docs} 篇独立文档 | 候选 {debug['candidates']} 条"
-          f" | diversity={'on' if debug['diversity_applied'] else 'off'}")
+        debug = retriever.last_debug
+        distinct_docs = len({hit.document_id for hit in hits})
+        print(f"\n[debug] Top-{len(hits)} 覆盖 {distinct_docs} 篇独立文档 | 候选 {debug['candidates']} 条"
+              f" | diversity={'on' if debug['diversity_applied'] else 'off'}")
+    finally:
+        if store is not None:
+            store.close()
 
 
 if __name__ == "__main__":
