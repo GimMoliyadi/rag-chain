@@ -28,6 +28,7 @@ from .ingest import IngestStats, run_ingest
 from .llm import BaseLLM, get_llm_client
 from .rag import ANSWER_VERIFICATION_UNAVAILABLE_ANSWER, MODE_NORMAL, source_to_dict
 from .retriever import EmbeddingMismatchError
+from .search_chain import collect_search_results, content_for_hit
 from .vectorstore import ChromaStore
 
 
@@ -121,11 +122,9 @@ def _register_routes(app: FastAPI) -> None:
         k: int = Query(default=5, ge=1, le=20),
         routed: bool = Query(default=False, description="按规则路由过滤知识域"),
     ):
-        """只检索不调用 LLM，用来单独验证检索效果。"""
-        router = app.state.rag.router
-        route = router.route(q) if routed and router is not None else None
-        domains = route.domains if route else None
-        hits = app.state.retriever.search(q, top_k=k, domains=domains or None)
+        """只检索不调用 LLM，用来单独验证进入 RAG Prompt 前的最终资料。"""
+        search_result = collect_search_results(app.state.rag, q, k, routed=routed)
+        hits = search_result.hits
         response = {
             "query": q,
             "top_k": k,
@@ -139,14 +138,14 @@ def _register_routes(app: FastAPI) -> None:
                     "heading": h.heading,
                     "source": h.source,
                     "chunk_index": h.chunk_index,
-                    "content": h.content,
+                    "content": content_for_hit(h, search_result.contents),
                 }
                 for i, h in enumerate(hits)
             ],
         }
 
         if routed:
-            response["route"] = asdict(route) if route else None
+            response["route"] = asdict(search_result.route) if search_result.route else None
         return response
 
     @app.post("/api/chat")
