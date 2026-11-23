@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -45,7 +46,13 @@ class ParsedDocument:
     updated_at: str = ""
 
 
-def iter_markdown_files(vault_path: Path, path_filter: str | None = None, limit: int | None = None) -> list[Path]:
+def iter_markdown_files(
+    vault_path: Path,
+    path_filter: str | None = None,
+    limit: int | None = None,
+    *,
+    on_error: Callable[[OSError], None] | None = None,
+) -> list[Path]:
     """递归找出 Vault 里所有需要处理的 .md 文件。
 
     path_filter 是相对路径的片段匹配，用来只 ingest 某个子目录，
@@ -54,7 +61,7 @@ def iter_markdown_files(vault_path: Path, path_filter: str | None = None, limit:
     limit 用于限制数量，做小规模冒烟测试。
     """
     results: list[Path] = []
-    for root, dirs, files in os.walk(vault_path):
+    for root, dirs, files in os.walk(vault_path, onerror=on_error):
         # 原地过滤子目录：隐藏目录（.obsidian 等）直接不往下走，省时间
         dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not d.startswith(".")]
 

@@ -7,7 +7,7 @@
     1. answer 必须非空
     2. answer 里出现的 [N] 必须都能对上 sources 里的真实编号
     3. sources 每一条都必须是索引里真实存在的 chunk（防代码或模型拼出假来源）
-    4. 检索为空时不得调用 LLM 自由发挥；检索有结果时恰好调用一次
+    4. 检索为空时不得调用 LLM 自由发挥
     5. 知识库确实没有的内容，必须明确说明"信息不足"而不是硬答
     6. answer 的主要事实能否在引用到的 context 里找到字面支撑
 
@@ -20,6 +20,7 @@
     python eval_rag.py --all                 # 用真实 LLM 跑全部题
     python eval_rag.py --all --limit 3       # 只跑前 3 题，调试脚本本身
     python eval_rag.py --all --mock          # 用 MockLLM 只验结构，不花钱
+    python eval_rag.py --mode raw --all      # 复跑旧版无门控基线
 """
 from __future__ import annotations
 
@@ -30,14 +31,18 @@ import sqlite3
 import sys
 import time
 from collections import Counter
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
+from app.citations import check_citations
 from app.config import Settings
 from app.database import connect
 from app.embedding import get_embedding_client
+from app.engine import build_engine
+from app.evidence import STATUS_INSUFFICIENT
 from app.llm import BaseLLM, MockLLM, get_llm_client
-from app.rag import RAGEngine
+from app.rag import EMPTY_KNOWLEDGE_BASE_ANSWER, RAGAnswer, RAGEngine
 from app.retriever import Retriever
 from app.vectorstore import ChromaStore
 
@@ -105,7 +110,9 @@ class EmptyRetriever:
 
     default_top_k = 5
 
-    def search(self, question: str, top_k: int | None = None) -> list:
+    def search(
+        self, question: str, top_k: int | None = None, domains: list[str] | None = None,
+    ) -> list:
         return []
 
 
@@ -191,7 +198,7 @@ def _make_row(
     used_chunks: int,
     sources: list,
     refs: list[int],
-    llm_calls: int,
+    llm_calls: int | None,
     latency_ms: float,
     context_filter: bool,
     support: dict | None,
@@ -217,6 +224,20 @@ def _make_row(
             for s in sources
         ],
     }
+
+
+def _source_findings(result: RAGAnswer, index: dict[str, set[str]], refs: list[int]) -> list[tuple[str, str]]:
+    findings = []
+    if not result.answer.strip():
+        findings.append((FAIL, "answer 为空"))
+    valid = {source.index for source in result.sources}
+    dangling = [ref for ref in refs if ref not in valid]
+    if dangling:
+        findings.append((FAIL, f"引用了不存在的编号 {dangling}"))
+    fake = [s.index for s in result.sources if s.file_path not in index.get(s.content, ())]
+    if fake:
+        findings.append((FAIL, f"sources 第 {fake} 条在索引里找不到对应 chunk"))
+    return findings
 
 
 def check_one(
@@ -269,23 +290,8 @@ def check_one(
 
     answer = result.answer
     sources = result.sources
-    valid_max = len(sources)
-    findings: list[tuple[str, str]] = []
-
-    # 1. 非空
-    if not answer.strip():
-        findings.append((FAIL, "answer 为空"))
-
-    # 2. 引用编号必须真实存在。编号不连续不算错——模型只引用它用到的资料是正常行为。
     refs = cited_indexes(answer)
-    dangling = [n for n in refs if n < 1 or n > valid_max]
-    if dangling:
-        findings.append((FAIL, f"引用了不存在的编号 {dangling}，sources 只有 {valid_max} 条"))
-
-    # 3. sources 必须是索引里真实存在的 chunk
-    fake = [s.index for s in sources if s.content not in index or s.file_path not in index[s.content]]
-    if fake:
-        findings.append((FAIL, f"sources 第 {fake} 条在索引里找不到对应 chunk"))
+    findings = _source_findings(result, index, refs)
 
     # 4. 检索为空不得调用模型；有结果恰好一次
     if result.used_chunks == 0 and recorder.calls != 0:
@@ -295,7 +301,7 @@ def check_one(
 
     # 5. 知识不足时必须说不足
     is_unknown = not question.get("expected_documents")
-    has_disclaimer = any(hint in answer for hint in INSUFFICIENT_HINTS)
+    has_disclaimer = answer == EMPTY_KNOWLEDGE_BASE_ANSWER or any(hint in answer for hint in INSUFFICIENT_HINTS)
     if result.used_chunks == 0:
         if not has_disclaimer:
             findings.append((FAIL, "检索为空且回答没有说明知识不足"))
@@ -334,6 +340,120 @@ def check_one(
     )
 
 
+def _production_outcome(result: RAGAnswer) -> str:
+    if result.used_chunks == 0:
+        return "no_hits"
+    if result.evidence and result.evidence.debug.get("judge_error"):
+        return "gate_error"
+    if result.evidence and result.evidence.status == STATUS_INSUFFICIENT:
+        return "insufficient"
+    if result.answer_verification and not result.answer_verification.passed:
+        if result.answer_verification.debug.get("judge_error"):
+            return "verification_error"
+        return "verification_blocked"
+    return "answered"
+
+
+def _normalize_path(path: str) -> str:
+    return path.replace("\\", "/").casefold()
+
+
+def _normalize_text(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _expected_evidence_findings(
+    question: dict, result: RAGAnswer, refs: list[int], severity: str,
+) -> list[tuple[str, str]]:
+    findings = []
+    cited = [s for s in result.sources if s.index in refs]
+    for expected in question.get("expected_evidence", []):
+        expected_path = _normalize_path(expected["file_path"])
+        quote = _normalize_text(expected["quote"])
+        if not any(
+            quote and _normalize_path(source.file_path) == expected_path
+            and quote in _normalize_text(source.content)
+            for source in cited
+        ):
+            findings.append((severity, f"未引用预期证据片段：{expected['file_path']}"))
+    cited_paths = {_normalize_path(s.file_path) for s in cited}
+    missing_documents = [
+        path for path in question.get("expected_documents", [])
+        if _normalize_path(path) not in cited_paths
+    ]
+    if missing_documents:
+        findings.append((REVIEW, f"未引用 {len(missing_documents)} 篇预期文档"))
+    answer = _normalize_text(result.answer).casefold()
+    missing_terms = [
+        term for term in question.get("expected_answer_terms", [])
+        if _normalize_text(term).casefold() not in answer
+    ]
+    if missing_terms:
+        findings.append((severity, f"答案缺少 {len(missing_terms)} 个预期要点"))
+    return findings
+
+
+def _production_findings(
+    question: dict, result: RAGAnswer, refs: list[int], outcome: str, llm_mock: bool,
+) -> list[tuple[str, str]]:
+    if llm_mock:
+        return [(REVIEW, "mock 模式只验证装配和响应结构")]
+    if outcome in {"gate_error", "verification_error"}:
+        return [(FAIL, f"证据评审或核验执行失败（{outcome}）")]
+    verified = question.get("verified") is True
+    severity = FAIL if verified else REVIEW
+    findings = [] if verified else [(REVIEW, "题目标注尚未确认")]
+    if question["category"] == "unknown":
+        if outcome == "answered":
+            level = REVIEW if not refs and any(hint in result.answer for hint in INSUFFICIENT_HINTS) else severity
+            findings.append((level, "系统未在检索、证据门控或核验阶段拒答"))
+        return findings
+    if outcome != "answered":
+        return findings + [(severity, f"预期可答但未生成可用答案（{outcome}）")]
+    if not refs:
+        findings.append((severity, "答案缺少有效引用"))
+    if not question.get("expected_evidence") or not question.get("expected_answer_terms"):
+        findings.append((REVIEW, "尚未标注证据片段和答案要点，需人工复核"))
+    findings += _expected_evidence_findings(question, result, refs, severity)
+    return findings
+
+
+def check_production(
+    question: dict, engine: RAGEngine, index: dict[str, set[str]], *,
+    context_filter: bool, llm_mock: bool,
+) -> dict:
+    started = time.perf_counter()
+    try:
+        result = engine.answer(question["question"])
+    except Exception as exc:
+        row = _make_row(
+            question, verdict=FAIL, answer="",
+            findings=[(FAIL, f"链路抛异常，没有回答：{_brief(exc)}")],
+            used_chunks=0, sources=[], refs=[], llm_calls=None,
+            latency_ms=(time.perf_counter() - started) * 1000,
+            context_filter=context_filter, support=None,
+        )
+        return {**row, "outcome": "error", "route_domains": [], "evidence": None,
+                "answer_verification": None, "timings": {}}
+    latency_ms = (time.perf_counter() - started) * 1000
+    refs = check_citations(result.answer, len(result.sources))["cited_indexes"]
+    outcome = _production_outcome(result)
+    findings = _source_findings(result, index, refs)
+    findings += _production_findings(question, result, refs, outcome, llm_mock)
+    row = _make_row(
+        question, verdict=_verdict(findings), answer=result.answer, findings=findings,
+        used_chunks=result.used_chunks, sources=result.sources, refs=refs, llm_calls=None,
+        latency_ms=latency_ms, context_filter=context_filter, support=None,
+    )
+    return {
+        **row, "outcome": outcome,
+        "route_domains": result.route.domains if result.route else [],
+        "evidence": result.evidence.to_dict() if result.evidence else None,
+        "answer_verification": result.answer_verification.to_dict() if result.answer_verification else None,
+        "timings": result.timings,
+    }
+
+
 def check_empty_retrieval_guard(llm: BaseLLM) -> dict:
     """白盒验证短路分支：检索恒为空时不得调用 LLM，且必须说明知识不足。
 
@@ -354,7 +474,7 @@ def check_empty_retrieval_guard(llm: BaseLLM) -> dict:
     findings: list[tuple[str, str]] = []
     if recorder.calls != 0:
         findings.append((FAIL, f"检索为空仍然调用了 LLM（{recorder.calls} 次）"))
-    if not any(hint in answer for hint in INSUFFICIENT_HINTS):
+    if answer != EMPTY_KNOWLEDGE_BASE_ANSWER:
         findings.append((FAIL, "检索为空的回答没有明确说明知识不足"))
 
     return {
@@ -420,12 +540,15 @@ def _print_detail(rows: list[dict], level: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="RAG 回答质量评估：PASS / REVIEW / FAIL")
     parser.add_argument("--questions", default="eval/retrieval_questions.json", help="题目 JSON 路径，复用检索评估的题集")
-    parser.add_argument("--mode", choices=("raw", "filter"), default="raw")
+    parser.add_argument(
+        "--mode", choices=("production", "raw", "filter"), default="production",
+        help="production 复用正式问答链路；raw、filter 保留历史基线",
+    )
     parser.add_argument("--mock", dest="llm_mock", action="store_true", help="用 MockLLM 只验结构和不变式，不调用真实模型")
     parser.add_argument("--all", dest="include_unverified", action="store_true", help="纳入 verified=false 的候选题")
     parser.add_argument("--limit", type=int, default=0, help="只跑前 N 题")
     parser.add_argument("--out", default="", help="结果 JSON 输出路径")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -444,45 +567,42 @@ def main(argv: list[str] | None = None) -> int:
         print("  没有题目可评估。人工确认题目（把 verified 改成 true）或加 --all 后再跑。")
         return 2
 
-    # mock 模式只验结构和不变式，不校验 LLM 凭证；其余模式必须真的连得上模型
-    settings = Settings()
-    if not args.llm_mock:
-        settings.validate_providers()
-
-    embedding = get_embedding_client(settings)
-    store = ChromaStore(settings.chroma_path_resolved)
-    retriever = Retriever(embedding=embedding, store=store, default_top_k=settings.top_k)
-    llm: BaseLLM = MockLLM() if args.llm_mock else get_llm_client(settings)
-    conn = connect(settings.db_path_resolved)
-    chunk_index = load_chunk_index(conn)
-    conn.close()
-
-    # 过滤器只作用在"进 context 的那一层"，retriever 保持原始行为
-    context_filter = args.mode == "filter"
-
-    print(f"  向量库   : {store.count()} 条 chunk / 索引内 chunk 原文 {len(chunk_index)} 条")
-    print(f"  LLM      : {llm.model_name}   context_filter={context_filter}")
-
-    # 先跑一次不计时的检索。CUDA 首查询会触发 kernel 编译和内存分配，
-    # 不预热的话第一题的耗时会把整组均值抬高一个数量级。
-    retriever.search("预热查询，不计入耗时统计", top_k=settings.top_k)
-
-    _print_banner("逐题评估（每题一次真实 LLM 调用）")
-    rows: list[dict] = []
-    for q in questions:
-        rows.append(
-            check_one(
-                q,
-                retriever,
-                llm,
-                chunk_index,
-                top_k=settings.top_k,
-                vault_name=settings.vault_name,
-                context_filter=context_filter,
-                filter_retrieve_top_k=settings.filter_retrieve_top_k,
-                llm_mock=args.llm_mock,
+    settings = Settings(llm_provider="mock") if args.llm_mock else Settings()
+    settings.validate_providers()
+    llm = get_llm_client(settings)
+    llm_mock = isinstance(llm, MockLLM)
+    production = args.mode == "production"
+    context_filter = settings.context_filter_enabled if production else args.mode == "filter"
+    with closing(connect(settings.db_path_resolved)) as conn:
+        chunk_index = load_chunk_index(conn)
+    with closing(ChromaStore(settings.chroma_path_resolved)) as store:
+        if production:
+            engine, _ = build_engine(settings, store=store, llm=llm)
+            retriever = engine.retriever
+        else:
+            retriever = Retriever(
+                embedding=get_embedding_client(settings), store=store, default_top_k=settings.top_k,
             )
-        )
+        chunk_count = store.count()
+        print(f"  向量库   : {chunk_count} 条 chunk / 索引内 chunk 原文 {len(chunk_index)} 条")
+        print(f"  LLM      : {llm.model_name}   context_filter={context_filter}")
+        retriever.search("预热查询，不计入耗时统计", top_k=settings.top_k)
+
+        _print_banner("逐题评估")
+        if production:
+            rows = [
+                check_production(q, engine, chunk_index, context_filter=context_filter, llm_mock=llm_mock)
+                for q in questions
+            ]
+        else:
+            rows = [
+                check_one(
+                    q, retriever, llm, chunk_index, top_k=settings.top_k,
+                    vault_name=settings.vault_name, context_filter=context_filter,
+                    filter_retrieve_top_k=settings.filter_retrieve_top_k, llm_mock=llm_mock,
+                )
+                for q in questions
+            ]
 
     _print_banner("汇总表")
     summary = _summary(rows)
@@ -513,11 +633,14 @@ def main(argv: list[str] | None = None) -> int:
                         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
                         "questions_file": str(Path(args.questions)),
                         "mode": args.mode,
-                        "llm_mock": args.llm_mock,
+                        "llm_mock": llm_mock,
                         "llm_model": llm.model_name,
                         "top_k": settings.top_k,
-                        "context_filter": args.mode == "filter",
-                        "chunks_in_index": store.count(),
+                        "context_filter": context_filter,
+                        "reranker_enabled": production and settings.reranker_enabled,
+                        "evidence_gate_enabled": production and settings.evidence_gate_enabled,
+                        "strict_evidence_enabled": production and settings.strict_evidence_enabled,
+                        "chunks_in_index": chunk_count,
                     },
                     "summary": summary,
                     "empty_retrieval_guard": guard,
@@ -530,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"\n结果已写入 {out_path}")
 
-    return 0 if not any(r["verdict"] == FAIL for r in rows) else 1
+    return 1 if guard["verdict"] == FAIL or any(r["verdict"] == FAIL for r in rows) else 0
 
 
 if __name__ == "__main__":

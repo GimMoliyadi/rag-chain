@@ -36,6 +36,27 @@ def test_api_search_requires_query(client):
     assert client.get("/api/search").status_code == 422
 
 
+def test_api_search_can_inspect_the_chat_rule_route(client, monkeypatch):
+    retriever = client.app.state.retriever
+    search = retriever.search
+    observed_domains = []
+
+    def record_domains(question, top_k=None, domains=None):
+        observed_domains.append(domains)
+        return search(question, top_k=top_k, domains=domains)
+
+    monkeypatch.setattr(retriever, "search", record_domains)
+    question = "什么是 POVM？"
+    global_search = client.get("/api/search", params={"q": question})
+    routed_search = client.get("/api/search", params={"q": question, "routed": True})
+    chat = client.post("/api/chat", json={"question": question})
+
+    assert global_search.status_code == routed_search.status_code == chat.status_code == 200
+    assert "route" not in global_search.json()
+    assert routed_search.json()["route"] == chat.json()["route"]
+    assert observed_domains == [None, ["quantum_mechanics"], ["quantum_mechanics"]]
+
+
 def test_api_documents_list_and_detail(client):
     r = client.get("/api/documents", params={"limit": 10})
     assert r.status_code == 200

@@ -116,10 +116,17 @@ def _register_routes(app: FastAPI) -> None:
         return doc
 
     @app.get("/api/search")
-    def search(q: str = Query(..., min_length=1, description="检索关键词"), k: int = Query(default=5, ge=1, le=20)):
+    def search(
+        q: str = Query(..., min_length=1, description="检索关键词"),
+        k: int = Query(default=5, ge=1, le=20),
+        routed: bool = Query(default=False, description="按规则路由过滤知识域"),
+    ):
         """只检索不调用 LLM，用来单独验证检索效果。"""
-        hits = app.state.retriever.search(q, top_k=k)
-        return {
+        router = app.state.rag.router
+        route = router.route(q) if routed and router is not None else None
+        domains = route.domains if route else None
+        hits = app.state.retriever.search(q, top_k=k, domains=domains or None)
+        response = {
             "query": q,
             "top_k": k,
             "count": len(hits),
@@ -137,6 +144,10 @@ def _register_routes(app: FastAPI) -> None:
                 for i, h in enumerate(hits)
             ],
         }
+
+        if routed:
+            response["route"] = asdict(route) if route else None
+        return response
 
     @app.post("/api/chat")
     def chat(request: ChatRequest):

@@ -14,6 +14,11 @@ local provider 是确定性的哈希向量：同一段文本每次都得到同�
 """
 from __future__ import annotations
 
+import errno
+import os
+from contextlib import closing
+from pathlib import Path
+
 import pytest
 
 from app.database import connect
@@ -521,6 +526,51 @@ def test_failed_file_is_not_treated_as_deleted(settings, fake_vault, monkeypatch
             conn.close()
         # 向量还在，说明没有误判成删除
         assert _still_indexed(store, embedding, old_texts) == old_texts
+    finally:
+        store.close()
+
+
+def test_directory_scan_error_skips_removal_until_a_complete_scan(settings, fake_vault, monkeypatch):
+    embedding = get_embedding_client(settings)
+    store = ChromaStore(settings.chroma_path_resolved)
+    inaccessible = fake_vault / "法律"
+    existing_path = "法律/合同违约.md"
+    deleted_path = "创业/MVP.md"
+    scandir = os.scandir
+
+    def fail_on_directory(path):
+        if Path(path) == inaccessible:
+            raise PermissionError(errno.EACCES, "测试目录无法读取", str(path))
+        return scandir(path)
+
+    try:
+        _ingest(settings, embedding, store)
+        with closing(_sqlite(settings)) as conn:
+            existing_chunks = _chunk_texts(conn, existing_path)
+            deleted_chunks = _chunk_texts(conn, deleted_path)
+        assert existing_chunks and deleted_chunks
+        (fake_vault / deleted_path).unlink()
+        (fake_vault / "新增.md").write_text("# 新增笔记\n\n正常处理可读文件。", encoding="utf-8")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "scandir", fail_on_directory)
+            stats = _ingest(settings, embedding, store)
+
+        assert (stats.scan_failures, stats.failed, stats.added, stats.removed) == (1, 1, 1, 0)
+        assert str(inaccessible) in stats.errors[0]
+        with closing(_sqlite(settings)) as conn:
+            assert _chunk_texts(conn, existing_path) == existing_chunks
+            assert _chunk_texts(conn, deleted_path) == deleted_chunks
+        assert _still_indexed(store, embedding, existing_chunks + deleted_chunks) == existing_chunks + deleted_chunks
+
+        stats = _ingest(settings, embedding, store)
+
+        assert (stats.scan_failures, stats.failed, stats.removed) == (0, 0, 1)
+        with closing(_sqlite(settings)) as conn:
+            assert _chunk_texts(conn, existing_path) == existing_chunks
+            assert _chunk_texts(conn, deleted_path) == []
+        assert _still_indexed(store, embedding, existing_chunks) == existing_chunks
+        assert _still_indexed(store, embedding, deleted_chunks) == []
     finally:
         store.close()
 

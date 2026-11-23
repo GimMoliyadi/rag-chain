@@ -59,10 +59,11 @@ class IngestStats:
     unchanged: int = 0       # 内容没变被跳过（增量生效的证据）
     metadata_updated: int = 0  # 正文没变、但 SQLite/Chroma 元数据已同步
     removed: int = 0         # 文件已从 Vault 删掉、库里被清掉的文档（删除同步）
-    failed: int = 0          # 解析或写入失败
+    failed: int = 0          # 扫描、解析或写入失败总数
     chunks_written: int = 0
     truncated: int = 0       # 超过 embedding 模型 token 上限、被截尾的 chunk
     errors: list[str] = field(default_factory=list)
+    scan_failures: int = 0
 
 
 class VectorCleanupError(RuntimeError):
@@ -232,7 +233,17 @@ def ingest_vault(
     否则被删的笔记会变成永远检索不到的"幽灵知识"。
     """
     stats = IngestStats()
-    files = iter_markdown_files(settings.vault_path_resolved, path_filter=path_filter, limit=limit)
+
+    def record_scan_error(error: OSError) -> None:
+        stats.scan_failures += 1
+        stats.failed += 1
+        directory = error.filename or settings.vault_path
+        stats.errors.append(f"Vault 目录扫描失败：{directory}：{error.strerror or error}")
+
+    files = iter_markdown_files(
+        settings.vault_path_resolved, path_filter=path_filter, limit=limit,
+        on_error=record_scan_error,
+    )
     stats.scanned = len(files)
 
     # 映射表整轮只读一次：900 多个文件每个都读一遍 YAML 是纯浪费
@@ -255,7 +266,8 @@ def ingest_vault(
             stats.failed += 1
             stats.errors.append(f"{path.as_posix()}: {exc}")
 
-    _remove_deleted(store, conn, seen_paths, stats, full_scan=path_filter is None and limit is None)
+    full_scan = path_filter is None and limit is None and stats.scan_failures == 0
+    _remove_deleted(store, conn, seen_paths, stats, full_scan=full_scan)
     return stats
 
 

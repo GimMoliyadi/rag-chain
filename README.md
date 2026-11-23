@@ -285,8 +285,8 @@ HTTP 入库响应同时报告 `removed` 和 `truncated`，便于核对删除同�
 - `--path` / `--limit` 只扫了一部分文件，这时候**无法**判断哪些是「被删了」——
   没扫到的文件不是被删，只是没看到。所以这两种模式下删除同步自动跳过，
   并会打印提示。要全库同步，跑一次不带参数的 `python ingest.py`。
-- 文件读不到（权限、临时锁定）不等于文件被删了。读失败的文件不会进入「已见」集合，
-  因此不会被判成删除，它的知识不会凭空消失。
+- 文件读取失败时保留它已有的索引。目录扫描失败时仍导入已找到的文件，并暂停本轮删除同步。
+  API 在 `scan_failures` 和 `errors` 中报告扫描失败，CLI 会打印跳过原因。下一次完整扫描会照常同步删除。
 
 **正文被清空**（只剩 frontmatter）也算一种修改：切块后一个 chunk 都没有，
 这种情况下旧的 chunk 和向量一样要清空，而不是保留。
@@ -565,7 +565,8 @@ uvicorn app.main:create_app --factory --reload
 | `POST /api/ingest` | 触发导入 |
 
 `/api/search` 按综合相关性排序；返回的 `score` 保持为原始向量余弦相似度，
-所以它不一定随返回排名单调下降。问答开启 reranker 时，`sources[].score` 是精排模型分数，
+所以它不一定随返回排名单调下降。加 `routed=true` 可查看与问答相同的规则路由和限定域内的检索结果。
+这个参数只使用规则路由，因此搜索接口依然无须调用 LLM。问答开启 reranker 时，`sources[].score` 是精排模型分数，
 不能和直接检索的向量相似度混比。
 
 ---
@@ -710,6 +711,13 @@ python scripts/retrieval_check.py                  # 300 个真实 chunk 建临�
 ---
 
 ## 评测结果怎么读（重要口径警告）
+
+`python eval_rag.py --questions eval/已核对题集.json --out eval/results/production.json`
+默认复用正式问答引擎，记录各阶段耗时、知识域、证据评审和答后核验结果。
+可答题用 `expected_evidence` 数组标记每处证据（元素包含 `file_path` 和 `quote`），
+用 `expected_answer_terms` 标记必须出现的要点。`unknown` 用于应拒答的题。
+证据评审或核验执行失败单独计为失败。`--mock` 可验证结构，`--mode raw` 和
+`--mode filter` 用于复跑历史基线。
 
 `eval/retrieval_questions.json` 里有 32 道题，**全部 `verified: false`，还一道都没有人工确认过。**
 
