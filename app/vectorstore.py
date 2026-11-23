@@ -114,15 +114,21 @@ class ChromaStore:
             for i, chunk_id in enumerate(result["ids"])
         ]
 
-    def query(self, embedding: list[float], n_results: int = 5, where: dict | None = None) -> list[dict]:
+    def query(
+        self, embedding: list[float], n_results: int = 5, where: dict | None = None,
+        *, where_document: dict | None = None,
+    ) -> list[dict]:
         """按向量找最近的 n_results 条，返回 [{content, distance, **metadata}]。
 
         where 是 Chroma 的 metadata 过滤条件（scoped retrieval 用它限定 domain），
         None / 空值表示不过滤——全库检索的路径必须保持和以前逐字节一致。
+        where_document 限定参与向量检索的正文。
         Chroma 原生的返回是 result["ids"][0] / result["metadatas"][0] 这种嵌套结构，
         在这里摊平成列表，上层就不用知道 Chroma 的返回格式了。
         """
         query_kwargs = {"where": where} if where else {}
+        if where_document:
+            query_kwargs["where_document"] = where_document
         result = self._col.query(
             query_embeddings=[embedding],
             n_results=n_results,
@@ -138,9 +144,9 @@ class ChromaStore:
             for i in range(len(ids))
         ]
 
-    def document_paths(self) -> list[str]:
+    def document_paths(self, where: dict | None = None) -> list[str]:
         """List the current indexed note paths without fetching chunks or vectors."""
-        result = self._col.get(include=["metadatas"])
+        result = self._col.get(where=where, include=["metadatas"])
         return sorted({meta["file_path"] for meta in result["metadatas"] if meta and meta.get("file_path")})
 
     def delete_by_document(self, document_id: int) -> None:

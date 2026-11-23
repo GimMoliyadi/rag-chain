@@ -142,6 +142,82 @@ def test_reranker_failure_reports_fallback_and_keeps_cosine():
     assert retriever.last_debug["reranker_applied"] is False
 
 
+def test_reranker_keeps_evidence_from_the_named_note_in_top_k():
+    from app.embedding import HashingEmbedding
+    from app.reranker import CrossEncoderReranker
+
+    rows = [
+        dict(chunk_id=i, document_id=i, chunk_index=0, content="其他笔记的例子",
+             distance=0.3, title=f"笔记{i}", file_path=f"其他/{i}.md")
+        for i in range(1, 6)
+    ]
+    rows.extend([
+        dict(chunk_id=6, document_id=6, chunk_index=0, content="博弈描述",
+             distance=0.35, title="囚徒困境", file_path="经典博弈/1. 囚徒困境.md"),
+        dict(chunk_id=7, document_id=6, chunk_index=1, content="均衡分析",
+             distance=0.4, title="囚徒困境", file_path="经典博弈/1. 囚徒困境.md"),
+    ])
+
+    class Model:
+        def predict(self, pairs, **kwargs):
+            scores = {"其他笔记的例子": 3.0, "均衡分析": 2.0, "博弈描述": 1.0}
+            return [scores[text] for _, text in pairs]
+
+    retriever = Retriever(
+        HashingEmbedding(32), _ScopedCandidateStore(rows),
+        reranker=CrossEncoderReranker(model=Model()),
+    )
+
+    hits = retriever.search("一次性囚徒困境为什么不会选择合作？")
+
+    assert len(hits) == 5
+    assert hits[0].document_id != 6
+    assert [hit.chunk_id for hit in hits if hit.document_id == 6] == [7]
+    assert hits[1].rerank_score == 2.0
+
+
+def test_cross_standard_search_recovers_linked_clauses_outside_the_vector_pool(tmp_path):
+    from app.embedding import HashingEmbedding
+    from app.reranker import CrossEncoderReranker
+
+    question = "这个标示流程要依次经过哪几部标准？"
+    embedding = HashingEmbedding(32)
+    vector = embedding.embed_query(question)
+    distant_vector = [-component for component in vector]
+    rows = [
+        dict(chunk_id=i, document_id=i, chunk_index=0, embedding=vector,
+             title="流程笔记", file_path=f"笔记/{i}.md", domain="tests", content="流程的一般说明")
+        for i in range(1, 52)
+    ]
+    for chunk_id, edition, domain, content in (
+        (52, "GB1000-2024", "tests", "材料验收应符合 GB 2000-2024 的规定。"),
+        (53, "GB2000-2024", "tests", "检验结果按 GB 3000-2024 标示。"),
+        (54, "GB3000-2024", "tests", "应说明是否按 GB 2000-2024 完成检验。"),
+        (55, "GB3000-2024", "tests", "## 关联笔记\n- [[GB 1000-2024]]\n- [[GB 2000-2024]]"),
+        (56, "GB4000-2024", "other", "其他知识域的条文提到了 GB 2000-2024。"),
+    ):
+        rows.append(dict(chunk_id=chunk_id, document_id=chunk_id, chunk_index=0, embedding=distant_vector,
+                         title="条文", file_path=f"标准/{edition}/{chunk_id}.md", domain=domain, content=content))
+
+    class Model:
+        def predict(self, pairs, **kwargs):
+            return [10.0 if text.startswith(("##", "其他知识域")) else 1.0 for _, text in pairs]
+
+    store = ChromaStore(tmp_path / "chroma")
+    try:
+        store.write_index_info(embedding.fingerprint)
+        store.upsert_chunks(rows)
+        retriever = Retriever(embedding, store, reranker=CrossEncoderReranker(model=Model()))
+
+        hits = retriever.search(question, top_k=3, domains=["tests"])
+        assert {hit.chunk_id for hit in hits} == {52, 53, 54}
+        assert all(hit.score == 0.0 and hit.rerank_score == 1.0 for hit in hits)
+        ordinary = retriever.search("这个标示流程有哪些标准？", domains=["tests"])
+        assert ordinary and all(hit.chunk_id < 52 for hit in ordinary)
+    finally:
+        store.close()
+
+
 def test_ingest_stats_look_right(ingested, settings):
     store, _, stats = ingested
     assert stats.scanned == 2

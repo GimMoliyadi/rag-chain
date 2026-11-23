@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from .retriever import SearchResult
+if TYPE_CHECKING:
+    from .retriever import SearchResult
 
 # 启用过滤时先多取这么多条，给过滤留余量。20 = 默认 top_k(5) × 4，
 # 导航 chunk 占比再高也够补满 5 条。

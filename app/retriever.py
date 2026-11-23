@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from itertools import zip_longest
 from typing import TYPE_CHECKING
 
+from .context_filter import judge_chunk
 from .embedding import BaseEmbedding
 from .vectorstore import ChromaStore
 
@@ -62,6 +63,11 @@ LEXICAL_BOOST_WEIGHT = 0.6
 
 _NON_WORD = re.compile(r"[^\w\u3400-\u9fff]+", re.UNICODE)
 _STANDARD_CODE = re.compile(r"(?i)(?<![A-Za-z0-9])GB\s*(\d{3,})\s*[-–]\s*(\d{2,})(?![A-Za-z0-9])")
+_STANDARD_REFERENCE = re.compile(r"(?i)(?<![A-Za-z0-9])GB\s*([0-9]{3,})")
+_CROSS_STANDARD_QUESTION = re.compile(
+    r"哪几部\s*标准|哪(?:些|几[部项个份]?)\s*(?:国家|行业)标准"
+    r"|(?:涉及|适用|遵循|经过)\s*哪(?:些|几[部项个份]?)\s*标准"
+)
 _PATH_REFERENCE = re.compile(r"(?:《|[\"'`])([^《》\"'`\r\n]+\.md)(?:》|[\"'`])", re.IGNORECASE)
 
 _VERSION_LEAD_IN = re.compile(r"^\s*(?:(?:标准|笔记)?\s*(?:中|里|回答)?\s*[:：,，]\s*)+")
@@ -163,6 +169,14 @@ class Retriever:
                     by_id.setdefault(int(row["chunk_id"]), row)
             rows = list(by_id.values())
 
+        reference_sources: dict[int, str] = {}
+        if _CROSS_STANDARD_QUESTION.search(question):
+            reference_rows, reference_sources = self._standard_reference_candidates(
+                question_vector, min(candidate_k, count), where,
+            )
+            existing_ids = {int(row["chunk_id"]) for row in rows}
+            rows.extend(row for row in reference_rows if int(row["chunk_id"]) not in existing_ids)
+
         candidates = len(rows)
         # 先用精确标题/章节信号把候选排好，再做同文档限额。若先限额，
         # 长文档的前两个向量命中可能把真正被问题点名的章节直接丢掉。
@@ -179,6 +193,10 @@ class Retriever:
                 for hit in ranked:
                     by_id[hit.chunk_id]["_rerank_score"] = hit.score
             rows = [by_id[hit.chunk_id] for hit in ranked]
+            if not rerank_fallback and len(expanded_documents) == 1:
+                _keep_named_document(rows, expanded_documents[0], min(k, self._default_top_k))
+        if reference_sources:
+            rows = _prioritize_standard_references(rows, reference_sources)
         if self._diversity_enabled:
             rows = _cap_per_document(rows, k, self._max_chunks_per_document)
         else:
@@ -197,6 +215,36 @@ class Retriever:
             "expanded_documents": expanded_documents,
         }
         return hits
+
+    def _standard_reference_candidates(
+        self, question_vector: list[float], candidate_k: int, where: dict | None,
+    ) -> tuple[list[dict], dict[int, str]]:
+        standards_by_path = {
+            path: standard for path in self._store.document_paths(where=where)
+            if (standard := _standard_family(path)) is not None
+        }
+        known_standards = set(standards_by_path.values())
+        if len(known_standards) < 2:
+            return [], {}
+
+        file_filter = {"file_path": {"$in": list(standards_by_path)}}
+        where = {"$and": [where, file_filter]} if where else file_filter
+        rows = self._store.query(
+            question_vector, n_results=candidate_k, where=where,
+            where_document={"$or": [{"$contains": prefix} for prefix in ("GB", "Gb", "gB", "gb")]},
+        )
+        linked_rows = []
+        reference_sources = {}
+        for row in rows:
+            source = standards_by_path[row["file_path"]]
+            references = {f"GB{number}" for number in _STANDARD_REFERENCE.findall(row["content"])}
+            if (references & known_standards) - {source} and not judge_chunk(row["content"]).is_navigation:
+                linked_rows.append(row)
+                reference_sources[int(row["chunk_id"])] = source
+
+        if len(set(reference_sources.values())) < 2:
+            return [], {}
+        return linked_rows, reference_sources
 
     def _search_scoped(
         self,
@@ -288,6 +336,25 @@ def _standard_id(value: str) -> str | None:
     return f"GB{match[1]}-{match[2]}" if match else None
 
 
+def _standard_family(path: str) -> str | None:
+    for part in _canonical_path(path).split("/"):
+        edition = _standard_id(part)
+        if edition:
+            return edition.split("-", 1)[0]
+    return None
+
+
+def _prioritize_standard_references(rows: list[dict], sources: dict[int, str]) -> list[dict]:
+    first_by_standard: dict[str, dict] = {}
+    for row in rows:
+        standard = sources.get(int(row["chunk_id"]))
+        if standard is not None:
+            first_by_standard.setdefault(standard, row)
+    primary = list(first_by_standard.values())
+    primary_ids = {int(row["chunk_id"]) for row in primary}
+    return primary + [row for row in rows if int(row["chunk_id"]) not in primary_ids]
+
+
 def _source_scopes(question: str) -> list[tuple[str, str, str]]:
     paths = [path for match in _PATH_REFERENCE.finditer(question) if "/" in (path := _canonical_path(match[1]))]
     if paths:
@@ -302,6 +369,17 @@ def _source_scopes(question: str) -> list[tuple[str, str, str]]:
         scope = f"GB{match[1]}-{match[2]}"
         scopes.extend(("edition", scope, clause) for clause in (queries or [question]))
     return scopes
+
+
+def _keep_named_document(rows: list[dict], document_id: int, top_k: int) -> None:
+    if top_k < 2:
+        return
+    for position, row in enumerate(rows):
+        if int(row["document_id"]) == document_id:
+            if position >= top_k:
+                # 保留精排首位，让点名笔记得分最高的片段也能进入问答上下文。
+                rows.insert(1, rows.pop(position))
+            return
 
 
 def _cap_per_document(rows: list[dict], top_k: int, max_per_document: int) -> list[dict]:
