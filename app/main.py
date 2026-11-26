@@ -120,9 +120,9 @@ def _register_routes(app: FastAPI) -> None:
     def search(
         q: str = Query(..., min_length=1, description="检索关键词"),
         k: int = Query(default=5, ge=1, le=20),
-        routed: bool = Query(default=False, description="按规则路由过滤知识域"),
+        routed: bool = Query(default=False, description="按知识域路由过滤"),
     ):
-        """只检索不调用 LLM，用来单独验证进入 RAG Prompt 前的最终资料。"""
+        """返回整理后的检索片段，路由遵循应用配置。"""
         search_result = collect_search_results(app.state.rag, q, k, routed=routed)
         hits = search_result.hits
         response = {

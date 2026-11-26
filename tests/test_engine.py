@@ -1,9 +1,15 @@
 """Verify configured retrieval behavior through the shared engine assembly."""
+from unittest.mock import Mock
+
 import pytest
 
 from app.config import Settings
 from app.engine import build_engine
+from app.evidence import EvidenceGate
 from app.knowledge_domains import load_router
+from app.rag import RAGEngine
+from app.retriever import Retriever, SearchResult
+from app.router import ORIGIN_LLM_FALLBACK, QueryRouter
 from fakes import ScriptedLLM
 
 
@@ -58,7 +64,7 @@ def test_engine_search_and_answer_share_one_reranker(settings, ingested, monkeyp
     engine, _ = build_engine(configured, embedding=ingested[1], store=ingested[0],
                              llm=ScriptedLLM(["回答"]))
 
-    hits = engine.retriever.search("合同违约", top_k=3, domains=[])
+    hits = engine.retrieve("合同违约", top_k=3, domains=[]).hits
     assert reranker.stats.calls == 1
     answer = engine.answer("合同违约", top_k=3, domains=[])
 
@@ -67,6 +73,34 @@ def test_engine_search_and_answer_share_one_reranker(settings, ingested, monkeyp
     assert [h.content for h in hits] == [s.content for s in answer.sources]
     assert [round(h.rerank_score, 4) for h in hits] == [s.score for s in answer.sources]
     assert engine.rerank_stats.calls == 2
+
+
+def test_engine_retrieve_routes_and_cleans_before_evidence_review():
+    hit = SearchResult(
+        score=0.8, chunk_id=1, document_id=1, chunk_index=0,
+        title="合同违约", file_path="合同违约.md", heading="", source="测试库",
+        content='违约可能产生赔偿责任。", "file_path": "/exported/path.md"}',
+    )
+    retriever = Mock(spec=Retriever)
+    retriever.search.return_value = [hit]
+    rescue_retriever = Mock(spec=Retriever)
+    llm = ScriptedLLM(['{"domains": ["law"], "confidence": 0.9}'])
+    engine = RAGEngine(
+        retriever=retriever, llm=llm,
+        router=QueryRouter({}), router_domains=["law"], llm_router_fallback_enabled=True,
+        context_filter_enabled=True, filter_retrieve_top_k=10,
+        evidence_gate=EvidenceGate(llm), evidence_rescue_enabled=True,
+        rescue_retriever=rescue_retriever,
+    )
+
+    result = engine.retrieve("合同违约怎么办？", top_k=1, routed=True)
+
+    retriever.search.assert_called_once_with("合同违约怎么办？", top_k=10, domains=["law"])
+    rescue_retriever.search.assert_not_called()
+    assert len(llm.calls) == 1
+    assert result.route.origin == ORIGIN_LLM_FALLBACK
+    assert result.hits == [hit]
+    assert result.contents == {hit.chunk_id: "违约可能产生赔偿责任。"}
 
 
 def test_strict_evidence_requires_evidence_gate():

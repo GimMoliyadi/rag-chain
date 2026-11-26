@@ -123,7 +123,7 @@ obsidian-rag-backend/
 ├── personal_context/     context.yaml 是你的私有上下文（已 gitignore，不进库）
 │                         example.yaml 是同构模板，进库
 ├── ingest.py             命令行：导入文档 / 增量更新 ← 构建完知识库后跑这条
-├── search.py             命令行：只检索、不调 LLM（排查检索用）
+├── search.py             命令行：检索知识库片段（排查检索用）
 ├── ask.py                命令行：完整问答 ← 日常入口
 ├── mcp_server.py         MCP 服务器：让 Claude Code 在对话里直接检索
 ├── eval_retrieval.py     检索评测：Recall@K / MRR
@@ -560,7 +560,7 @@ uvicorn app.main:create_app --factory --reload
 | `GET /health` | 健康检查，附带库里的文档数/chunk 数/当前模型 |
 | `GET /api/documents?limit=50&offset=0` | 分页列出已入库文档（不含全文） |
 | `GET /api/documents/{id}` | 单篇文档全文 + 元信息 |
-| `GET /api/search?q=关键词&k=5` | 只检索不调 LLM |
+| `GET /api/search?q=关键词&k=5` | 检索并返回知识库片段 |
 | `POST /api/chat` | 完整 RAG 问答 |
 | `POST /api/ingest` | 触发导入 |
 
@@ -646,7 +646,7 @@ claude mcp get obsidian-rag     # 确认 Status: √ Connected
 | 工具 | 用途 |
 |---|---|
 | `ask` | 自然语言提问，返回带引用来源的答案。默认用它。 |
-| `search` | 只检索不调 LLM，按综合相关性返回原文片段并显示原始向量相似度。用来排查"答案来源不对"或想直接看笔记原文。 |
+| `search` | 按综合相关性返回检索片段并显示原始向量相似度。用来排查答案来源。 |
 
 **为什么没有 ingest 工具？** 因为读和写要分开：MCP 里开 ingest 等于让 AI 在对话里随手改你的知识库。改知识库必须显式跑 `python ingest.py`。
 
@@ -664,7 +664,7 @@ claude mcp get obsidian-rag     # 确认 Status: √ Connected
 
 代价就是第一问要等约一分钟。之后同一个进程里反复问都不再加载——和 `ask.py` 交互模式复用同一个引擎是同一个道理。
 
-`search` 工具默认走知识域路由（`ask.py` / `search.py` 命令行不默认开，因为终端里可以加 `--router` 自己决定）：不加路由的话，问"海因里希法则"会被量子力学的相似词（变分法、绝热近似）挤到前面，检索到完全无关的领域。这条行为有个测试守着——`tests/test_mcp_server.py::test_routed_domains_*`。
+MCP `search` 默认启用知识域路由。HTTP 检索可传 `routed=true`，CLI 检索可传 `--router`。启用路由后，规则没有命中且 `LLM_ROUTER_FALLBACK_ENABLED=true` 时，三个入口都会用配置的 LLM 判断知识域。
 
 ### 证据不足的警告不会被吃掉
 

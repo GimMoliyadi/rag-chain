@@ -1,6 +1,6 @@
-"""独立检索命令，不调用 LLM。
+"""独立检索命令，返回知识库片段。
 
-先跑这个确认检索正常，再去调 LLM。检索错了后面全错，这是最该先验证的一环。
+开启 --router 时复用问答的路由设置，包括可选的 LLM 路由兜底。
 
 用法：
     python search.py "合同违约需要承担什么责任？"
@@ -15,27 +15,26 @@ import json
 
 from app.config import Settings
 from app.engine import build_engine
-from app.llm import MockLLM
 from app.search_chain import collect_search_results, content_for_hit
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="在知识库向量索引里按综合相关性检索（不调用 LLM）")
+    parser = argparse.ArgumentParser(description="在知识库向量索引里按综合相关性检索")
     parser.add_argument("question", help="要检索的问题或关键词")
     parser.add_argument("--k", type=int, default=None, help="返回条数，默认用 .env 里的 TOP_K")
     parser.add_argument("--domains", default=None, help="只在这些知识域里检索，逗号分隔（手动指定，跳过 Router）")
-    parser.add_argument("--router", action="store_true", help="先用 QueryRouter 判断知识域，再 scoped 检索")
+    parser.add_argument("--router", action="store_true", help="按知识域路由，遵循 LLM 路由兜底配置")
     args = parser.parse_args()
     if args.router and args.domains:
         raise SystemExit("--router 和 --domains 只能二选一：一个是路由决定域，一个是手动指定域")
 
     settings = Settings()
-    # search.py 只排查检索，不应该因为真实 LLM 凭证缺失而启动失败；
-    # build_engine 仍然复用同一套 RAG 装配，但 LLM 注入 MockLLM，避免调外部服务。
-    settings.llm_provider = "mock"
+    # 只有显式开启路由及 LLM 兜底时，检索才需要配置真实 LLM 凭证。
+    if not (args.router and settings.llm_router_fallback_enabled):
+        settings.llm_provider = "mock"
     store = None
     try:
-        engine, store = build_engine(settings, llm=MockLLM())
+        engine, store = build_engine(settings)
         total = store.count()
         print(f"向量库已有 {total} 个 chunk")
         if total == 0:
