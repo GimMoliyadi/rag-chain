@@ -57,6 +57,30 @@ def test_api_search_can_inspect_the_chat_rule_route(client, monkeypatch):
     assert observed_domains == [None, ["quantum_mechanics"], ["quantum_mechanics"]]
 
 
+def test_api_search_uses_same_final_sources_as_chat(client):
+    """/api/search 是排查“最终进入 Prompt 的资料”的入口。
+
+    它必须和 /api/chat 的 sources 保持同一批、同一顺序；否则调试 search
+    看到的是一套资料，chat 真正拿去生成的是另一套资料。
+    """
+    question = "合同违约了该怎么处理？"
+    search = client.get("/api/search", params={"q": question, "k": 5})
+    chat = client.post("/api/chat", json={"question": question, "top_k": 5})
+
+    assert search.status_code == chat.status_code == 200
+    search_results = search.json()["results"]
+    sources = chat.json()["sources"]
+
+    assert len(search_results) == len(sources)
+    assert [
+        (hit["title"], hit["file_path"], hit["heading"], hit["content"])
+        for hit in search_results
+    ] == [
+        (source["title"], source["file_path"], source["heading"], source["chunk"])
+        for source in sources
+    ]
+
+
 def test_api_documents_list_and_detail(client):
     r = client.get("/api/documents", params={"limit": 10})
     assert r.status_code == 200

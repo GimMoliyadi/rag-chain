@@ -44,6 +44,7 @@ from app.rag import (
     RAGEngine,
 )
 from app.retriever import EmbeddingMismatchError, SearchResult
+from app.search_chain import collect_search_results, content_for_hit
 
 # 和 app.main.ChatRequest 的约束保持一致：top_k 上限 20
 MAX_TOP_K = 20
@@ -52,7 +53,7 @@ INSTRUCTIONS = """\
 你的 Obsidian 知识库检索工具（私人笔记，只读，不改任何文件）。
 
 - ask：问自然语言问题，返回带引用来源的答案。默认用它。
-- search：只检索不调 LLM，按综合相关性返回原文片段，并显示原始向量相似度。
+- search 按综合相关性返回检索片段，并显示原始向量相似度。
   当 ask 的答案来源不对、或者你想直接看笔记原文时用它。
 
 工具返回「证据不足」警告时，只能说明本次检索返回的资料不足；不能据此断言
@@ -105,15 +106,15 @@ def build_server() -> MCPServer:
 
     @server.tool()
     def search(question: str, top_k: int | None = None) -> str:
-        """在你的知识库里按语义检索原文片段，先按知识域过滤再检索。
+        """在你的知识库里排查 RAG 最终会使用哪些原文片段。
 
-        返回综合相关性排名、原始向量相似度和文件路径，不调 LLM。
+        返回综合相关性排名、原始向量相似度和文件路径。路由遵循应用配置。
         用来排查检索效果：看期望的文档排在第几、被什么挤掉了。
         """
         engine, settings = _engine()
         k = _clamp_top_k(top_k, settings.top_k)
-        hits = engine.retriever.search(question, top_k=k, domains=_routed_domains(engine, question))
-        return render_hits(hits)
+        search_result = collect_search_results(engine, question, k, routed=True)
+        return render_hits(search_result.hits, search_result.contents)
 
     return server
 
@@ -202,7 +203,7 @@ def render_answer(result: RAGAnswer, elapsed: float) -> str:
     return "\n".join(lines).rstrip()
 
 
-def render_hits(hits: list[SearchResult]) -> str:
+def render_hits(hits: list[SearchResult], contents: dict[int, str] | None = None) -> str:
     """把检索命中渲染成给 LLM 读的 Markdown，编号从 1 开始。"""
     if not hits:
         return "检索没有返回任何 chunk——检查向量库是否已导入（`python ingest.py`）。"
@@ -212,7 +213,7 @@ def render_hits(hits: list[SearchResult]) -> str:
         lines.append(f"[{i + 1}] 原始向量相似度 {hit.score:.4f}")
         lines.append(f"    文档：{hit.title}{heading}")
         lines.append(f"    文件：{hit.file_path}")
-        lines.append(f"    原文：{hit.content}")
+        lines.append(f"    原文：{content_for_hit(hit, contents)}")
         lines.append("")
     return "\n".join(lines).rstrip()
 

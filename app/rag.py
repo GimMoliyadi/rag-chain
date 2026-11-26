@@ -168,6 +168,16 @@ class Source:
 
 
 @dataclass
+class SearchChainResult:
+    """一次只检索调用的结果。"""
+
+    hits: list[SearchResult]
+    contents: dict[int, str] | None = None
+    route: RouteDecision | None = None
+    timings: dict = field(default_factory=dict)
+
+
+@dataclass
 class RAGAnswer:
     """一次 RAG 问答的完整结果。"""
 
@@ -285,6 +295,28 @@ class RAGEngine:
         （变分法、绝热近似）挤到前面，检索到完全无关的领域。
         """
         return self._router
+
+    def retrieve(
+        self,
+        question: str,
+        top_k: int,
+        *,
+        routed: bool = False,
+        domains: list[str] | None = None,
+    ) -> SearchChainResult:
+        """返回路由、精排、去重及可选清洗后的检索结果。
+
+        routed=True 时复用问答的路由逻辑。手动指定 domains 时直接按域检索。
+        此方法在证据评审、救援与答案生成之前返回。
+        """
+        if routed and domains is not None:
+            raise ValueError("routed=True 与手动 domains 不能同时使用")
+
+        timings: dict = {}
+        route = self._route_if_needed(question, domains, timings) if routed else None
+        effective_domains = (route.domains or None) if route is not None else domains
+        hits, contents = self._collect(question, top_k, effective_domains)
+        return SearchChainResult(hits=hits, contents=contents, route=route, timings=timings)
 
     def answer(
         self,
