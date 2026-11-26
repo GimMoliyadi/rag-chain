@@ -39,6 +39,10 @@ def collect_search_results(
 
     routed=True 时走和 chat 相同的路由入口；domains 手动指定时跳过路由，
     语义与完整 RAGEngine.answer(domains=...) 一致。
+
+    这里保留在 RAGEngine 边界外的薄胶水里：HTTP / CLI / MCP 只依赖这个
+    函数，不再各自手写检索流程。若未来 RAGEngine 暴露正式 public 方法，
+    只需要改这一处适配层。
     """
     if routed and domains is not None:
         raise ValueError("routed=True 与手动 domains 不能同时使用")
